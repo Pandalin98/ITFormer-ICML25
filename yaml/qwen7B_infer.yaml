@@ -1,0 +1,39 @@
+model: TimeSeriesEncoder
+d_model: 512
+n_heads: 8
+e_layers: 4
+patch_len: 60
+stride: 60
+input_len: 600
+dropout: 0.1
+
+tt_d_model: 896
+tt_n_heads: 16
+tt_layers: 2
+tt_dropout: 0.1
+prefix_num: 25
+
+llm_model_path: checkpoints/LLM/Qwen2.5-7B-Instruct
+
+pretrain: false
+min_mask_ratio: 0.7
+max_mask_ratio: 0.8
+
+
+ts_path_test: dataset/dataset_processing/data_merged_new.h5
+qa_path_test: dataset/dataset_processing/test_sw3000.jsonl
+
+
+do_train: true
+per_device_train_batch_size: 6
+per_device_eval_batch_size: 6
+learning_rate: !!float 3e-5
+gradient_accumulation_steps: 1
+num_train_epochs: 2
+weight_decay: !!float 1e-6
+freeze_ts_model: true
+
+fp16: true
+dataloader_pin_memory: true
+dataloader_num_workers: 4
+
