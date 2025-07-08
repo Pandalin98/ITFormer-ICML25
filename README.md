@@ -62,7 +62,7 @@ If you use this code in your research, please cite our paper:
 
 ## License
 
-[Add your license information here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Contact
 
