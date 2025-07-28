@@ -14,7 +14,8 @@ from datetime import datetime
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from utils.metrics import open_question_metrics,closed_question_metrics,compute_rul
-from typing import List, Dict, Any  
+from typing import List, Dict, Any
+from accelerate import Accelerator  
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -42,28 +43,57 @@ def main_inference(args):
     print(f"🔧 Using config file: {args.config}")
     print(f"💾 Results will be saved to: {args.output_dir}")
     
+    # Initialize accelerator
+    accelerator = Accelerator()
+    
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     args.__dict__.update(config)
 
     print("\n🔨 Building model configuration...")
     tlmconfig = TLMConfig(
-        llm_model_path=args.llm_model_path,
-        freeze_ts_model=args.freeze_ts_model,
         ts_pad_num=args.prefix_num
     )
     
     print("⚙️ Initializing model...")
-    model = TLM.from_pretrained(args.model_checkpoint, config=tlmconfig, ts_config=args).cuda()
+    
+    # Simple model loading like original code
+    model = TLM.from_pretrained(args.model_checkpoint, config=tlmconfig, ts_config=args)
+    
+    # Initialize LLM components first
+    model._initialize_llm_components(args.model_checkpoint)
+    
+    # 打印model的总参数量
+    # 分别记录llm和itformer和ts_encoder的参数，用M做单位
+    def count_params(module):
+        if module is None:
+            return 0
+        return sum(p.numel() for p in module.parameters())
+
+    llm_params = count_params(model.llm_model) / 1e6
+    itformer_params = count_params(model.itformer) / 1e6
+    ts_encoder_params = count_params(model.ts_encoder) / 1e6
+    total_params = count_params(model) / 1e6
+
+    print(f"\n🔢 Model parameter counts (in M):")
+    print(f"   LLM:         {llm_params:.2f}M")
+    print(f"   ITFormer:    {itformer_params:.2f}M")
+    print(f"   TS_Encoder:  {ts_encoder_params:.2f}M")
+    print(f"   Total:       {total_params:.2f}M")
+    
+    # Prepare model with accelerator
+    model = accelerator.prepare(model)
     
     model.eval()
     print(f"✅ Model loaded successfully! Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
     print("\n📊 Preparing test dataset...")
-    tokenizer = AutoTokenizer.from_pretrained(tlmconfig.llm_model_path)
+    # Load tokenizer directly from LLM/Qwen2.5-0.5B-Instruct
+    llm_path = "LLM/Qwen2.5-0.5B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(llm_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(llm_path, trust_remote_code=True)
     
     tokenizer.padding_side = 'left'
-    processor = AutoProcessor.from_pretrained(tlmconfig.llm_model_path)
     
     test_dataset = TsQaDataset(
         args.ts_path_test,
@@ -80,6 +110,9 @@ def main_inference(args):
         num_workers=args.num_workers
     )
     
+    # Prepare dataloader with accelerator
+    test_loader = accelerator.prepare(test_loader)
+    
     print(f"📁 Test set size: {len(test_dataset)} samples")
     print(f"🔢 Batch size: {args.batch_size}, Total batches: {len(test_loader)}")
     print("\n🔍 Starting test set inference...")
@@ -89,18 +122,14 @@ def main_inference(args):
         for batch_idx, batch in enumerate(tqdm(test_loader, desc="Inference progress")):
             # if batch_idx==20:
             #     break
-            input_ids = batch['input_ids'].cuda()
-            ts_values = batch['ts_values'].cuda()
-            attention_mask = batch['attention_mask'].cuda()
-            query_ids = batch['query_ids'].cuda()
-            stages = batch['stage'].cuda()
+            # Data is already on the correct device thanks to accelerator
             
             generated_ids = model.generate(
-                input_ids=input_ids,
-                query_ids=query_ids,
-                ts_values=ts_values,
-                stage=stages,
-                attention_mask=attention_mask,
+                input_ids=batch['input_ids'],
+                query_ids=batch['query_ids'],
+                ts_values=batch['ts_values'],
+                stage=batch['stage'],
+                attention_mask=batch['attention_mask'],
                 max_new_tokens=args.max_new_tokens,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
@@ -203,9 +232,9 @@ def save_metrics(metrics: Dict[str, Any], output_dir: str, config_base: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='yaml/qwen7B_infer.yaml', help='YAML config')
+    parser.add_argument('--config', type=str, default='yaml/infer.yaml', help='YAML config')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='output_dir')
-    parser.add_argument('--model_checkpoint', type=str, default='checkpoints/ITformer', help='checkpoint path')
+    parser.add_argument('--model_checkpoint', type=str, default='checkpoints/Qwen-0.5B', help='checkpoint path')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=4)

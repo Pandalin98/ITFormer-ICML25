@@ -367,12 +367,13 @@ def debug_tokenizer_and_vocab(tokenizer):
 
 if __name__ == "__main__":
     # 配置
-    tlmconfig = TLMConfig(llm_model_path='LLM/Qwen2.5-0.5B-Instruct')
+    tlmconfig = TLMConfig()
     ts_path = 'dataset/dataset_processing/data_merged_new.h5'
     qa_path = 'dataset/dataset_processing/test_sw3000.jsonl'
     
     # 初始化tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tlmconfig.llm_model_path)
+    model_path = 'checkpoints/Qwen-0.5B'  # 使用默认模型路径
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.padding_side = 'left'
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -380,7 +381,7 @@ if __name__ == "__main__":
     # 调试tokenizer
     debug_tokenizer_and_vocab(tokenizer)
     
-    processor = AutoProcessor.from_pretrained(tlmconfig.llm_model_path)
+    processor = AutoProcessor.from_pretrained(model_path)
     
     # 创建训练数据集进行测试
     print("\n=== 创建训练数据集 ===")

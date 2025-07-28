@@ -15,37 +15,10 @@ from safetensors import safe_open
 import traceback
 class TLMConfig(PretrainedConfig):
     model_type = "vlm_model"
-    def __init__(self,llm_model_path = '/home/user/Qwen2.5-7B-Instruct',
-                 freeze_ts_model = True,
-                 ts_pad_num = 25,
-                **kwargs):
-        self.llm_model_path = llm_model_path
-        self.freeze_ts_model = freeze_ts_model
+    def __init__(self, ts_pad_num = 25, **kwargs):
         self.ts_pad_num = ts_pad_num
         super().__init__(**kwargs)
 
-def compute_loss(logits, labels, loss_fn, stage):
-        stage_weights = {1: 1, 2: 1, 3: 2, 4: 1}
-        total_loss = 0
-        total_weight = sum(stage_weights.values())
-        stage = torch.tensor(stage, dtype=torch.long, device=labels.device)  
-        for stage_value, weight in stage_weights.items():
-            mask = stage == stage_value 
-
-            if mask.any():
-                stage_outputs = logits[mask].view(-1, logits.size(-1))
-                stage_labels = labels[mask].view(-1)
-                stage_loss = loss_fn(stage_outputs, stage_labels)
-
-                total_loss += weight * stage_loss
-
-        loss = total_loss / total_weight
-        return loss
-        
-        
-        
-
-        
 class GradientAndActivationMonitor:
     def __init__(self, model, track_outputs=True, whitelist_patterns=None, verbose=False):
         self.model = model
@@ -117,15 +90,9 @@ class TLM(PreTrainedModel, GenerationMixin):
     def __init__(self, config, ts_config):
         super().__init__(config)
         self.config = config
+        self.ts_config = ts_config
         
-        # Initialize llm model
-        self.llm_model = AutoModelForCausalLM.from_pretrained(self.config.llm_model_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.llm_model_path)
-        self.llm_model.config.pad_token_id = self.tokenizer.pad_token_id
-        
-        ts_config.llm_d_model = self.llm_model.config.hidden_size
-        
-        # Initialize tsencoder
+        # Initialize tsencoder first
         self.ts_encoder = Model(ts_config)
         # load ts checkpoints
         if hasattr(ts_config, 'load_ts_encoder') and ts_config.load_ts_encoder:
@@ -133,16 +100,52 @@ class TLM(PreTrainedModel, GenerationMixin):
             
         self.itformer = ITformer(ts_config)
         
-        self.ts_project = nn.Linear(ts_config.d_model, ts_config.tt_d_model)
-        self.query_project = nn.Linear(self.llm_model.config.hidden_size, ts_config.tt_d_model)
-        self.fusion_project = nn.Linear(ts_config.tt_d_model, self.llm_model.config.hidden_size)
+        # Initialize LLM model and other components
+        self.llm_model = None
+        self.tokenizer = None
+        self.ts_project = None
+        self.query_project = None
+        self.fusion_project = None
+        self.loss_fct = None
         
-        self._setup_parameter_training()
+        # These will be initialized after LLM model is loaded
+        self._initialized = False
+
+    def _initialize_llm_components(self, model_path):
+        """Initialize LLM model and related components"""
+        if self._initialized:
+            return
+            
+        # Load LLM directly from LLM/Qwen2.5-0.5B-Instruct
+        llm_path = "LLM/Qwen2.5-0.5B-Instruct"
+        self.llm_model = AutoModelForCausalLM.from_pretrained(llm_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_path, trust_remote_code=True)
+        self.llm_model.config.pad_token_id = self.tokenizer.pad_token_id
         
-        self.loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+        # Update ts_config with LLM model info
+        self.ts_config.llm_d_model = self.llm_model.config.hidden_size
         
+        # Initialize projection layers
+        self.ts_project = nn.Linear(self.ts_config.d_model, self.ts_config.tt_d_model)
+        self.query_project = nn.Linear(self.llm_model.config.hidden_size, self.ts_config.tt_d_model)
+        self.fusion_project = nn.Linear(self.ts_config.tt_d_model, self.llm_model.config.hidden_size)
+        
+        # Set all parameters to eval mode for inference
+        self.llm_model.eval()
+        self.ts_encoder.eval()
+        self.itformer.eval()
+        self.ts_project.eval()
+        self.query_project.eval()
+        self.fusion_project.eval()
+        
+        # Freeze all parameters for inference
+        for param in self.parameters():
+            param.requires_grad = False
+            
         if accelerator.is_main_process:
-            self._print_trainable_parameters()
+            print("✅ Model initialized for inference - all parameters frozen")
+            
+        self._initialized = True
 
     def _load_ts_encoder_weights(self, checkpoint_path):
         try:
@@ -169,114 +172,7 @@ class TLM(PreTrainedModel, GenerationMixin):
             if accelerator.is_main_process:
                 print(f"❌ Failed to load TS encoder weights: {e}")
 
-    def _setup_parameter_training(self):
-
-        if accelerator.is_main_process:
-            print('🧊 Completely freezing ALL LLM parameters')
-        for name, param in self.llm_model.named_parameters():
-            param.requires_grad = False
-            if accelerator.is_main_process and any(key in name.lower() for key in ['embed_tokens', 'lm_head']):
-                print(f"🧊 Frozen: {name}")
-        
-        if self.config.freeze_ts_model:
-            if accelerator.is_main_process:
-                print('🧊 Freezing Time Series Encoder')
-            for name, param in self.ts_encoder.named_parameters():
-                param.requires_grad = False
-        else:
-            if accelerator.is_main_process:
-                print('🔥 Training Time Series Encoder (unfrozen)')
-            for name, param in self.ts_encoder.named_parameters():
-                param.requires_grad = True
-        
-        for component_name, component in [
-            ('itformer', self.itformer), 
-            ('ts_project', self.ts_project),
-            ('query_project', self.query_project), 
-            ('fusion_project', self.fusion_project)
-        ]:
-            for param in component.parameters():
-                param.requires_grad = True
-            if accelerator.is_main_process:
-                total_params = sum(p.numel() for p in component.parameters())
-                print(f"🔥 {component_name}: {total_params:,} trainable parameters")
-
-    def _print_trainable_parameters(self):
-        total_params = 0
-        trainable_params = 0
-        
-        module_stats = {}
-        
-        for name, param in self.named_parameters():
-            total_params += param.numel()
-            
-            # 按模块分类
-            if name.startswith('llm_model'):
-                module_name = 'llm_model'
-            elif name.startswith('ts_encoder'):
-                module_name = 'ts_encoder'
-            elif name.startswith('itformer'):
-                module_name = 'itformer'
-            else:
-                module_name = name.split('.')[0]
-            
-            if module_name not in module_stats:
-                module_stats[module_name] = {'total': 0, 'trainable': 0}
-            
-            module_stats[module_name]['total'] += param.numel()
-            
-            if param.requires_grad:
-                trainable_params += param.numel()
-                module_stats[module_name]['trainable'] += param.numel()
-        
-        print(f"\n📊 detailed parameter statistics:")
-        print(f"total parameters: {trainable_params:,}")
-        print(f"trainable parameters: {100 * trainable_params / total_params:.2f}%")
-        
-        print(f"\n📋 module details:")
-        for module, stats in module_stats.items():
-            total = stats['total']
-            trainable = stats['trainable']
-            ratio = 100 * trainable / total if total > 0 else 0
-            status = "🔥" if trainable > 0 else "🧊"
-            print(f"{status} {module:15s}: {trainable:>10,} / {total:>10,} ({ratio:>5.1f}%)")
-
-    def get_parameter_groups(self, base_lr=5e-4, llm_lr_ratio=0.1):
-        llm_params = []
-        ts_encoder_params = []
-        other_params = []
-        
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-                
-            if 'llm_model' in name:
-                llm_params.append(param)
-            elif 'ts_encoder' in name:
-                ts_encoder_params.append(param)
-            else:
-                other_params.append(param)
-        
-        param_groups = []
-        
-        if other_params:
-            param_groups.append({'params': other_params, 'lr': base_lr, 'name': 'other'})
-        
-        if ts_encoder_params:
-            param_groups.append({'params': ts_encoder_params, 'lr': base_lr, 'name': 'ts_encoder'})
-            
-        if llm_params:
-            param_groups.append({'params': llm_params, 'lr': base_lr * llm_lr_ratio, 'name': 'llm'})
-        
-        if accelerator.is_main_process:
-            print(f"\n📋 parameter set:")
-            for group in param_groups:
-                param_count = sum(p.numel() for p in group['params'])
-                print(f"{group['name']}: {param_count:,} parameters, lr={group['lr']}")
-        
-        return param_groups
-
-    def prepare_inputs_for_generation(self, input_ids,query_ids, past_key_values=None, attention_mask=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, query_ids, past_key_values=None, attention_mask=None, **kwargs):
         ts_values = kwargs.get("ts_values", None)
         stage = kwargs.get("stage", None)
         
@@ -307,9 +203,9 @@ class TLM(PreTrainedModel, GenerationMixin):
             "attention_mask": attention_mask,
         }
 
-    def forward(self, input_ids=None, labels=None,query_ids=None, 
+    def forward(self, input_ids=None, labels=None, query_ids=None, 
                 ts_values=None, inputs_embeds=None, stage=None, index=None,
-                attention_mask=None, past_key_values=None, mode='train', **kwargs):
+                attention_mask=None, past_key_values=None, **kwargs):
         
         if inputs_embeds is None:
             query_embeds = self.llm_model.get_input_embeddings()(query_ids)
@@ -325,14 +221,7 @@ class TLM(PreTrainedModel, GenerationMixin):
                                  use_cache=True)
         
         logits = outputs.logits
-
-        if mode == 'train':
-            loss = None
-            if labels is not None:
-                loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-            return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=outputs.past_key_values)
-        else:
-            return CausalLMOutputWithPast(logits=logits, past_key_values=outputs.past_key_values)
+        return CausalLMOutputWithPast(logits=logits, past_key_values=outputs.past_key_values)
 
     def merge_input_ids_with_ts_features(self, ts_features, inputs_embeds, input_ids):
         batch_size, seq_len, embed_dim = inputs_embeds.shape
@@ -355,21 +244,5 @@ class TLM(PreTrainedModel, GenerationMixin):
 
         return inputs_embeds
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        
-        if not self.config.freeze_ts_model:
-            self.ts_encoder.train(mode)
-        else:
-            self.ts_encoder.eval()
-            
-        self.itformer.train(mode)
-        self.ts_project.train(mode)
-        self.query_project.train(mode)
-        self.fusion_project.train(mode)
-        
-        self.llm_model.eval()
 
-        
-        return self
 

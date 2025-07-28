@@ -1,0 +1,26 @@
+model: TimeSeriesEncoder
+d_model: 512
+n_heads: 8
+e_layers: 4
+patch_len: 60
+stride: 60
+input_len: 600
+dropout: 0.1
+
+tt_d_model: 896
+tt_n_heads: 16
+tt_layers: 2
+tt_dropout: 0.1
+prefix_num: 25
+
+pretrain: false
+min_mask_ratio: 0.7
+max_mask_ratio: 0.8
+
+ts_path_test: dataset/datasets/time_series_data.h5
+qa_path_test: dataset/datasets/test_qa.jsonl
+
+fp16: true
+dataloader_pin_memory: true
+dataloader_num_workers: 4
+
