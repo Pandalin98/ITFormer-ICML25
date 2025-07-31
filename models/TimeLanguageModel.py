@@ -78,6 +78,8 @@ class TLM(PreTrainedModel, GenerationMixin):
         if not os.path.exists(model_path):
             model_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
 
+        state_dict = None
+        # 1. Try normal files
         if os.path.exists(model_path):
             if accelerator.is_main_process:
                 print(f"Loading model weights from: {model_path}")
@@ -85,28 +87,38 @@ class TLM(PreTrainedModel, GenerationMixin):
                 state_dict = load_file(model_path)
             else:
                 state_dict = torch.load(model_path, map_location='cpu')
-            
+        else:
+            # 2. Try split safetensors in the same directory
+            all_files = os.listdir(pretrained_model_name_or_path)
+            safetensors_files = [f for f in all_files if f.startswith('model-') and f.endswith('.safetensors')]
+            safetensors_files.sort()  # Ensure order
+            if safetensors_files:
+                if accelerator.is_main_process:
+                    print(f"Loading split safetensors from: {pretrained_model_name_or_path}")
+                state_dict = {}
+                for fname in safetensors_files:
+                    fpath = os.path.join(pretrained_model_name_or_path, fname)
+                    part = load_file(fpath)
+                    state_dict.update(part)
+                if accelerator.is_main_process:
+                    print(f"Successfully loaded {len(safetensors_files)} split safetensors files.")
+        if state_dict is not None:
             # Separate LLM weights from other weights
             llm_weights = {}
             other_weights = {}
-            
             for k, v in state_dict.items():
                 if k.startswith('llm_model.'):
                     llm_weights[k] = v
                 else:
                     other_weights[k] = v
-            
             if accelerator.is_main_process:
                 print(f"Found {len(llm_weights)} LLM weights (will be ignored)")
                 print(f"Found {len(other_weights)} non-LLM weights (will be loaded)")
-            
             # Load only non-LLM weights
             missing_keys, unexpected_keys = model.load_state_dict(other_weights, strict=False)
-            
             # Filter out LLM-related missing keys since we're not loading LLM weights
             llm_missing_keys = [k for k in missing_keys if k.startswith('llm_model.')]
             non_llm_missing_keys = [k for k in missing_keys if not k.startswith('llm_model.')]
-            
             if llm_missing_keys and accelerator.is_main_process:
                 print(f"LLM missing keys (ignored): {len(llm_missing_keys)} keys")
             if non_llm_missing_keys and accelerator.is_main_process:
@@ -115,7 +127,7 @@ class TLM(PreTrainedModel, GenerationMixin):
                 print(f"Unexpected keys: {unexpected_keys}")
         else:
             if accelerator.is_main_process:
-                print(f"Warning: No model weights found at {model_path}")
+                print(f"Warning: No model weights found at {model_path} or in split safetensors.")
 
         return model
 
