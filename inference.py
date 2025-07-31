@@ -210,14 +210,14 @@ def main_inference(args):
                 })
     if accelerator.is_main_process:
         print("\n📊 Calculating evaluation metrics...")
-    metrics = compute_metrics_from_results(results)
+    metrics = compute_metrics_from_results(results,args)
     if accelerator.is_main_process:
         print_metrics(metrics)
         config_base = os.path.basename(args.config).split('.yaml')[0]
         save_results(results, args.output_dir, config_base)
         save_metrics(metrics, args.output_dir, config_base)
 
-def compute_metrics_from_results(results: List[Dict]) -> Dict[str, Any]:
+def compute_metrics_from_results(results: List[Dict],args) -> Dict[str, Any]:
     """Compute evaluation metrics for each stage from inference results."""
     stage1_data = [r for r in results if r['stage'] == 1]
     stage2_data = [r for r in results if r['stage'] == 2]
@@ -225,7 +225,8 @@ def compute_metrics_from_results(results: List[Dict]) -> Dict[str, Any]:
     stage4_data = [r for r in results if r['stage'] == 4]
     # Create special_id, consistent with Time-QA
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained('LLM/Qwen2.5-0.5B-Instruct')
+    # 为了和设置的模型对齐，tokenizer应与主模型保持一致
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path)
     special_id = tokenizer.all_special_ids  
     common_punctuations = [".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "-", "_", "\"", "'"]
     punctuation_ids = tokenizer.convert_tokens_to_ids(common_punctuations)
