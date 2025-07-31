@@ -74,9 +74,24 @@ def main_inference(args):
         print("\n⚙️ Loading model from checkpoint...")
     # Import TLMConfig
     from models.TimeLanguageModel import TLMConfig
+    
+    # Determine LLM model path based on ITFormer model size
+    if '0.5B' in args.model_checkpoint:
+        llm_model_path = 'LLM/Qwen2.5-0.5B-Instruct'
+    elif '3B' in args.model_checkpoint:
+        llm_model_path = 'LLM/Qwen2.5-3B-Instruct'
+    elif '7B' in args.model_checkpoint:
+        llm_model_path = 'LLM/Qwen2.5-7B-Instruct'
+    else:
+        # Default to 7B if size cannot be determined
+        llm_model_path = 'LLM/Qwen2.5-7B-Instruct'
+    
+    if accelerator.is_main_process:
+        print(f"🔗 Using LLM model: {llm_model_path}")
+    
     # Create TLMConfig
     tlm_config = TLMConfig(
-        llm_model_path='LLM/Qwen2.5-0.5B-Instruct',
+        llm_model_path=llm_model_path,
         freeze_ts_model=True,
         ts_pad_num=args.prefix_num
     )
@@ -148,8 +163,8 @@ def main_inference(args):
         else:
             batch_iterator = test_loader
         for batch_idx, batch in enumerate(batch_iterator):
-            if batch_idx ==16:
-                break
+            # if batch_idx ==16:
+            #     break
             # Data is already on the correct device thanks to accelerator
             generated_ids = model.generate(
                 input_ids=batch['input_ids'],
@@ -268,7 +283,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TLM Inference')
     parser.add_argument('--config', type=str, default='yaml/infer.yaml', help='YAML config file')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Output directory')
-    parser.add_argument('--model_checkpoint', type=str, default='checkpoints/checkpoint-2114', help='Model checkpoint path')
+    parser.add_argument('--model_checkpoint', type=str, default='checkpoints/ITFormer-0.5B', help='Model checkpoint path')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers')
