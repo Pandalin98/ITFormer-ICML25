@@ -13,10 +13,6 @@ tt_layers: 2
 tt_dropout: 0.1
 prefix_num: 25
 
-pretrain: false
-min_mask_ratio: 0.7
-max_mask_ratio: 0.8
-
 ts_path_test: dataset/datasets/time_series_data.h5
 qa_path_test: dataset/datasets/test_qa.jsonl
 

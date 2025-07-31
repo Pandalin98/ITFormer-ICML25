@@ -1,8 +1,17 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+InstructTime Attention mechanism for time series processing.
+Implements channel-wise and temporal attention for multimodal fusion.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class InstructTimeAttention(nn.Module):
+    """InstructTime Attention mechanism combining channel and temporal attention."""
+    
     def __init__(
             self,
             dim,
@@ -13,6 +22,17 @@ class InstructTimeAttention(nn.Module):
             proj_drop=0.,
             norm_layer=nn.LayerNorm
     ):
+        """Initialize InstructTime Attention.
+        
+        Args:
+            dim: Input dimension
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias in QKV projections
+            qk_norm: Whether to normalize Q and K
+            attn_drop: Attention dropout rate
+            proj_drop: Projection dropout rate
+            norm_layer: Normalization layer type
+        """
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -21,55 +41,73 @@ class InstructTimeAttention(nn.Module):
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         
+        # Query, Key, Value projections
         self.query_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.key_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.value_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        
+        # Channel-wise attention projections
         self.channel_query_proj = nn.Linear(dim, dim, bias=qkv_bias)  
         self.channel_key_proj = nn.Linear(dim, dim, bias=qkv_bias) 
         self.channel_value_proj = nn.Linear(dim, dim, bias=qkv_bias) 
 
-       
+        # Output projection and dropout
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
 
     def forward(self, query, memory, mask=None):
-
+        """Forward pass for InstructTime Attention.
+        
+        Args:
+            query: Query tensor of shape (batch_size, L_q, d)
+            memory: Memory tensor of shape (batch_size, L_p, V, d)
+            mask: Optional attention mask
+            
+        Returns:
+            torch.Tensor: Attention output
+        """
         batch_size, L_q, d = query.size()
         _, L_p, V, _ = memory.size()
 
-   
+        # Channel-wise attention
         query_channel = self.channel_query_proj(query)  # Shape: (batch_size, L_q, d)
         key_channel = self.channel_key_proj(memory).mean(dim=1)     # Shape: (batch_size, V, d)
         value_channel = self.channel_value_proj(memory) # Shape: (batch_size, L_p, V, d)
 
-
+        # Reshape for multi-head attention
         query_channel = self.q_norm(query_channel.view(batch_size, self.num_heads, L_q, self.head_dim))  # (batch_size, num_heads, L_q, head_dim)
         key_channel = self.k_norm(key_channel.view(batch_size, self.num_heads, V, self.head_dim)) # (batch_size, num_heads, V, head_dim)
         value_channel = value_channel.view(batch_size, self.num_heads, L_p, V, self.head_dim)  # (batch_size, num_heads, L_p, V, head_dim)
         
-
+        # Compute channel attention scores
         channel_scores = torch.matmul(query_channel, key_channel.transpose(-2, -1)) / self.scale  # (batch_size, num_heads, L_q, V)
         channel_weights = F.softmax(channel_scores, dim=-1)  # Normalize across channels
         channel_output = torch.einsum('bnqv,bnlvd->bnld', channel_weights, value_channel)  # (batch_size, num_heads, L_p, head_dim)
 
+        # Reshape channel output
         channel_output = channel_output.transpose(1, 2).contiguous()  # (batch_size, L_p, num_heads, head_dim)
         memory_aggregated = channel_output.view(batch_size, L_p, d)  # (batch_size, L_p, d)
 
+        # Temporal attention
         Q = self.query_proj(query)  # Shape: (batch_size, L_q, d)
         K = self.key_proj(memory_aggregated)  # Shape: (batch_size, L_p, d)
         V = self.value_proj(memory_aggregated)  # Shape: (batch_size, L_p, d)
 
+        # Reshape for multi-head attention
         Q = self.q_norm(Q.view(batch_size, L_q, self.num_heads, self.head_dim).transpose(1, 2))  # (batch_size, num_heads, L_q, head_dim)
         K = self.k_norm(K.view(batch_size, L_p, self.num_heads, self.head_dim).transpose(1, 2))  # (batch_size, num_heads, L_p, head_dim)
         V = V.view(batch_size, L_p, self.num_heads, self.head_dim).transpose(1, 2)  # (batch_size, num_heads, L_p, head_dim)
 
+        # Compute temporal attention scores
         attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # (batch_size, num_heads, L_q, L_p)
         attention_weights = F.softmax(attention_scores, dim=-1)  # (batch_size, num_heads, L_q, L_p)
         attention_output = torch.matmul(attention_weights, V)  # (batch_size, num_heads, L_q, head_dim)
 
+        # Reshape output
         attention_output = attention_output.transpose(1, 2).contiguous()  # (batch_size, L_q, num_heads, head_dim)
         output = attention_output.view(batch_size, L_q, d)  # (batch_size, L_q, d)
 
+        # Final projection
         output = self.proj(output)
 
         return output
