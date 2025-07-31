@@ -17,7 +17,7 @@ from models.TimeLanguageModel import TLM
 from datetime import datetime
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from utils.metrics import open_question_metrics, closed_question_metrics, compute_rul
+from utils.metrics import open_question_metrics, closed_question_metrics
 from typing import List, Dict, Any
 from accelerate import Accelerator  
 
@@ -74,32 +74,16 @@ def main_inference(args):
         print("\n⚙️ Loading model from checkpoint...")
     # Import TLMConfig
     from models.TimeLanguageModel import TLMConfig
-    # Create TLM config
+    # Create TLMConfig
     tlm_config = TLMConfig(
-        llm_model_path=args.llm_model_path if hasattr(args, 'llm_model_path') else 'LLM/Qwen2.5-0.5B-Instruct',
+        llm_model_path='LLM/Qwen2.5-0.5B-Instruct',
         freeze_ts_model=True,
         ts_pad_num=args.prefix_num
     )
-    # Create TSConfig
-    class TSConfig:
-        def __init__(self):
-            self.model = args.model
-            self.d_model = args.d_model
-            self.n_heads = args.n_heads
-            self.e_layers = args.e_layers
-            self.patch_len = args.patch_len
-            self.stride = args.stride
-            self.input_len = args.input_len
-            self.dropout = args.dropout
-            self.tt_d_model = args.tt_d_model
-            self.tt_n_heads = args.tt_n_heads
-            self.tt_layers = args.tt_layers
-            self.tt_dropout = args.tt_dropout
-            self.prefix_num = args.prefix_num
-    ts_config = TSConfig()
-    # Load model
+    
+    # Load model - let from_pretrained handle configuration loading
     from models.TimeLanguageModel import TLM
-    model = TLM.from_pretrained(args.model_checkpoint, config=tlm_config, ts_config=ts_config)
+    model = TLM.from_pretrained(args.model_checkpoint, config=tlm_config)
     # Print model parameter statistics only in the main process
     if accelerator.is_main_process:
         param_counts = count_model_parameters(model)
@@ -164,6 +148,8 @@ def main_inference(args):
         else:
             batch_iterator = test_loader
         for batch_idx, batch in enumerate(batch_iterator):
+            if batch_idx ==16:
+                break
             # Data is already on the correct device thanks to accelerator
             generated_ids = model.generate(
                 input_ids=batch['input_ids'],

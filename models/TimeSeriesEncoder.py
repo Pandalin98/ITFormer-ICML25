@@ -1,8 +1,5 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-Time Series Encoder implementation.
-Provides various encoding mechanisms for time series data processing.
+Time Series Encoder
 """
 import math
 import torch
@@ -13,24 +10,14 @@ from timm.layers.helpers import to_2tuple
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
+
 def calculate_unfold_output_length(input_length, size, step):
-    """Calculate output length after unfolding operation.
-    
-    Args:
-        input_length: Length of input sequence
-        size: Size of each window
-        step: Step size for sliding window
-        
-    Returns:
-        int: Number of output windows
-    """
+    # Calculate the number of windows
     num_windows = (input_length - size) // step + 1
     return num_windows
 
 
 class CrossAttention(nn.Module):
-    """Cross-attention mechanism for time series processing."""
-    
     def __init__(
             self,
             dim,
@@ -42,18 +29,6 @@ class CrossAttention(nn.Module):
             norm_layer=nn.LayerNorm,
             var_num=None,
     ):
-        """Initialize cross-attention.
-        
-        Args:
-            dim: Input dimension
-            num_heads: Number of attention heads
-            qkv_bias: Whether to use bias in QKV projections
-            qk_norm: Whether to normalize Q and K
-            attn_drop: Attention dropout rate
-            proj_drop: Projection dropout rate
-            norm_layer: Normalization layer type
-            var_num: Number of variables
-        """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -74,15 +49,6 @@ class CrossAttention(nn.Module):
         self.var_num = var_num
 
     def forward(self, x, query=None):
-        """Forward pass for cross-attention.
-        
-        Args:
-            x: Input tensor of shape (B, N, C)
-            query: Optional query tensor
-            
-        Returns:
-            torch.Tensor: Attention output
-        """
         B, N, C = x.shape
         if query is not None:
             q = self.q(query).reshape(
@@ -111,9 +77,9 @@ class CrossAttention(nn.Module):
         return x
 
 
-class FeedForward(nn.Module):
-    """Feed-forward network for time series processing."""
-    
+
+
+class FeedFoward(nn.Module):
     def __init__(
             self,
             dim,
@@ -126,19 +92,6 @@ class FeedForward(nn.Module):
             prefix_token_length=None,
             group=1,
     ):
-        """Initialize feed-forward network.
-        
-        Args:
-            dim: Input dimension
-            hidden_features: Hidden layer dimension
-            out_features: Output dimension
-            act_layer: Activation layer type
-            norm_layer: Normalization layer type
-            bias: Whether to use bias
-            drop: Dropout rate
-            prefix_token_length: Length of prefix tokens
-            group: Group size for grouped convolution
-        """
         super().__init__()
         dim = dim
         hidden_features = hidden_features or 4*dim
@@ -146,7 +99,8 @@ class FeedForward(nn.Module):
         bias = to_2tuple(bias)
         drop_probs = to_2tuple(drop)
 
-        self.fc1 = nn.Linear(dim, hidden_features, bias=bias[0])
+        self.fc1 = nn.Linear(dim, hidden_features,
+                              bias=bias[0])
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
 
@@ -159,34 +113,21 @@ class FeedForward(nn.Module):
         self.prefix_token_length = prefix_token_length
 
     def forward(self, x):
-        """Forward pass for feed-forward network.
-        
-        Args:
-            x: Input tensor of shape (n, var, l, d)
-            
-        Returns:
-            torch.Tensor: Output tensor
-        """
         n, var, l, d = x.shape
+        # x = x.view(-1, d) # (n*var, l, c)
+        # x = x.transpose(-1, -2) # (n*var, c, l)
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop1(x)
         x = self.fc2(x)
         x = self.norm(x)
-        x = self.drop2(x) + x
+        x = self.drop2(x)+x
         return x
 
 
+
 class LearnablePositionalEmbedding(nn.Module):
-    """Learnable positional embedding for time series."""
-    
     def __init__(self, d_model, max_len=5000):
-        """Initialize learnable positional embedding.
-        
-        Args:
-            d_model: Model dimension
-            max_len: Maximum sequence length
-        """
         super(LearnablePositionalEmbedding, self).__init__()
         # Compute the positional encodings once in log space.
         self.pe = nn.Parameter(torch.zeros(
@@ -205,20 +146,10 @@ class LearnablePositionalEmbedding(nn.Module):
         del pe
 
     def forward(self, x, offset=0):
-        """Forward pass for learnable positional embedding.
-        
-        Args:
-            x: Input tensor
-            offset: Position offset
-            
-        Returns:
-            torch.Tensor: Positional embeddings
-        """
         return self.pe[:, :, offset:offset+x.size(2)]
 
 
 class SeqAttention(nn.Module):
-    """Sequential attention mechanism."""
 
     def __init__(
             self,
@@ -230,17 +161,6 @@ class SeqAttention(nn.Module):
             proj_drop=0.,
             norm_layer=nn.LayerNorm,
     ):
-        """Initialize sequential attention.
-        
-        Args:
-            dim: Input dimension
-            num_heads: Number of attention heads
-            qkv_bias: Whether to use bias in QKV projections
-            qk_norm: Whether to normalize Q and K
-            attn_drop: Attention dropout rate
-            proj_drop: Projection dropout rate
-            norm_layer: Normalization layer type
-        """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -255,15 +175,6 @@ class SeqAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, attn_mask=None):
-        """Forward pass for sequential attention.
-        
-        Args:
-            x: Input tensor of shape (B, N, C)
-            attn_mask: Optional attention mask
-            
-        Returns:
-            torch.Tensor: Attention output
-        """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
                                   self.head_dim).permute(2, 0, 3, 1, 4)
@@ -281,7 +192,6 @@ class SeqAttention(nn.Module):
 
 
 class VarAttention(nn.Module):
-    """Variable attention mechanism."""
 
     def __init__(
             self,
@@ -293,17 +203,6 @@ class VarAttention(nn.Module):
             proj_drop=0.,
             norm_layer=nn.LayerNorm,
     ):
-        """Initialize variable attention.
-        
-        Args:
-            dim: Input dimension
-            num_heads: Number of attention heads
-            qkv_bias: Whether to use bias in QKV projections
-            qk_norm: Whether to normalize Q and K
-            attn_drop: Attention dropout rate
-            proj_drop: Projection dropout rate
-            norm_layer: Normalization layer type
-        """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -317,14 +216,6 @@ class VarAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-        """Forward pass for variable attention.
-        
-        Args:
-            x: Input tensor of shape (B, N, P, C)
-            
-        Returns:
-            torch.Tensor: Attention output
-        """
         B, N, P, C = x.shape
 
         qkv = self.qkv(x).reshape(B, N, P, 3, self.num_heads,
@@ -349,35 +240,17 @@ class VarAttention(nn.Module):
 
 
 class GateLayer(nn.Module):
-    """Gate layer for controlling information flow."""
-    
     def __init__(self, dim, init_values=1e-5, inplace=False):
-        """Initialize gate layer.
-        
-        Args:
-            dim: Input dimension
-            init_values: Initial values for gate
-            inplace: Whether to perform operation in-place
-        """
         super().__init__()
         self.inplace = inplace
         self.gate = nn.Linear(dim, 1)
 
     def forward(self, x):
-        """Forward pass for gate layer.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            torch.Tensor: Gated output
-        """
         gate_value = self.gate(x)
         return gate_value.sigmoid() * x
 
 
 class SeqAttBlock(nn.Module):
-    """Sequential attention block."""
 
     def __init__(
             self,
@@ -391,22 +264,9 @@ class SeqAttBlock(nn.Module):
             drop_path=0.,
             norm_layer=nn.LayerNorm,
     ):
-        """Initialize sequential attention block.
-        
-        Args:
-            dim: Input dimension
-            num_heads: Number of attention heads
-            qkv_bias: Whether to use bias in QKV projections
-            qk_norm: Whether to normalize Q and K
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate
-            init_values: Initial values for scaling
-            drop_path: Drop path rate
-            norm_layer: Normalization layer type
-        """
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = SeqAttention(
+        self.attn_seq = SeqAttention(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -416,27 +276,24 @@ class SeqAttBlock(nn.Module):
             norm_layer=norm_layer,
         )
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
+        # self.proj = nn.Linear(dim, dim)
 
     def forward(self, x, attn_mask):
-        """Forward pass for sequential attention block.
-        
-        Args:
-            x: Input tensor
-            attn_mask: Attention mask
-            
-        Returns:
-            torch.Tensor: Output tensor
-        """
         x_input = x
         x = self.norm1(x)
-        x = self.attn(x, attn_mask)
-        x = x_input + self.drop_path(x)
+        n_vars, n_seqs = x.shape[1], x.shape[2]
+        x = torch.reshape(
+            x, (-1, x.shape[-2], x.shape[-1]))
+        x = self.attn_seq(x, attn_mask)
+        x = torch.reshape(
+            x, (-1, n_vars, n_seqs, x.shape[-1]))
+        x = x_input + self.drop_path1(x)
         return x
 
 
 class VarAttBlock(nn.Module):
-    """Variable attention block."""
 
     def __init__(
             self,
@@ -450,22 +307,9 @@ class VarAttBlock(nn.Module):
             drop_path=0.,
             norm_layer=nn.LayerNorm,
     ):
-        """Initialize variable attention block.
-        
-        Args:
-            dim: Input dimension
-            num_heads: Number of attention heads
-            qkv_bias: Whether to use bias in QKV projections
-            qk_norm: Whether to normalize Q and K
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate
-            init_values: Initial values for scaling
-            drop_path: Drop path rate
-            norm_layer: Normalization layer type
-        """
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = VarAttention(
+        self.attn_var = VarAttention(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -474,27 +318,17 @@ class VarAttBlock(nn.Module):
             proj_drop=proj_drop,
             norm_layer=norm_layer,
         )
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        # self.ls1 = GateLayer(dim, init_values=init_values)
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
+        # self.proj = nn.Linear(dim, dim)
 
     def forward(self, x):
-        """Forward pass for variable attention block.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        x_input = x
-        x = self.norm1(x)
-        x = self.attn(x)
-        x = x_input + self.drop_path(x)
+        x = x + self.drop_path1(self.attn_var(self.norm1(x)))
         return x
 
 
 class MLPBlock(nn.Module):
-    """MLP block for time series processing."""
 
     def __init__(
             self,
@@ -508,22 +342,9 @@ class MLPBlock(nn.Module):
             mlp_layer=None,
             prefix_token_length=0,
     ):
-        """Initialize MLP block.
-        
-        Args:
-            dim: Input dimension
-            mlp_ratio: MLP expansion ratio
-            proj_drop: Projection dropout rate
-            init_values: Initial values for scaling
-            drop_path: Drop path rate
-            act_layer: Activation layer type
-            norm_layer: Normalization layer type
-            mlp_layer: MLP layer type
-            prefix_token_length: Length of prefix tokens
-        """
         super().__init__()
         self.norm2 = norm_layer(dim)
-        if mlp_layer is FeedForward:
+        if mlp_layer is FeedFoward:
             self.mlp = mlp_layer(
                 in_features=dim,
                 hidden_features=int(dim * mlp_ratio),
@@ -532,35 +353,27 @@ class MLPBlock(nn.Module):
                 prefix_token_length=prefix_token_length,
             )
         else:
-            self.mlp = Mlp(
+            self.mlp = mlp_layer(
                 in_features=dim,
                 hidden_features=int(dim * mlp_ratio),
                 act_layer=act_layer,
                 drop=proj_drop,
             )
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.ls2 = GateLayer(dim, init_values=init_values)
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x, prefix_seq_len=None):
-        """Forward pass for MLP block.
-        
-        Args:
-            x: Input tensor
-            prefix_seq_len: Length of prefix sequence
-            
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        x_input = x
-        x = self.norm2(x)
-        x = self.mlp(x)
-        x = x_input + self.drop_path(x)
+        if prefix_seq_len is not None:
+            x = x + \
+                self.drop_path2(
+                    self.ls2(self.mlp(self.norm2(x), prefix_seq_len=prefix_seq_len)))
+        else:
+            x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
 
 class BasicBlock(nn.Module):
-    """Basic transformer block combining attention and MLP."""
-
     def __init__(
             self,
             dim,
@@ -576,248 +389,185 @@ class BasicBlock(nn.Module):
             norm_layer=nn.LayerNorm,
             prefix_token_length=0,
     ):
-        """Initialize basic transformer block.
-        
-        Args:
-            dim: Input dimension
-            num_heads: Number of attention heads
-            mlp_ratio: MLP expansion ratio
-            qkv_bias: Whether to use bias in QKV projections
-            qk_norm: Whether to normalize Q and K
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate
-            init_values: Initial values for scaling
-            drop_path: Drop path rate
-            act_layer: Activation layer type
-            norm_layer: Normalization layer type
-            prefix_token_length: Length of prefix tokens
-        """
         super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = SeqAttention(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-            norm_layer=norm_layer,
-        )
+        self.seq_att_block = SeqAttBlock(dim=dim, num_heads=num_heads,
+                                         qkv_bias=qkv_bias, qk_norm=qk_norm,
+                                         attn_drop=attn_drop, init_values=init_values, proj_drop=proj_drop,
+                                         drop_path=drop_path, norm_layer=norm_layer)
 
-        self.feed_forward = FeedForward(dim=dim, hidden_features=dim*4, act_layer=act_layer, drop=proj_drop)
+        self.var_att_block = VarAttBlock(dim=dim, num_heads=num_heads,
+                                         qkv_bias=qkv_bias, qk_norm=qk_norm,
+                                         attn_drop=attn_drop, init_values=init_values, proj_drop=proj_drop,
+                                         drop_path=drop_path, norm_layer=norm_layer)
+
+
+        self.feed_forward = FeedFoward(dim=dim, hidden_features=dim*4, act_layer=act_layer, drop=proj_drop)
 
     def forward(self, x, prefix_seq_len, attn_mask):
-        """Forward pass for basic transformer block.
-        
-        Args:
-            x: Input tensor
-            prefix_seq_len: Length of prefix sequence
-            attn_mask: Attention mask
-            
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        x_input = x
-        x = self.norm1(x)
-        x = self.attn(x, attn_mask)
-        x = x_input + x
-        x_input = x
+        x = self.var_att_block(x)
+        x = self.seq_att_block(x, attn_mask)
         x = self.feed_forward(x)
-        x = x_input + x
         return x
 
 
 class Patchfy(nn.Module):
-    """Patchify layer for time series data."""
-    
     def __init__(self, patch_len, stride):
-        """Initialize patchify layer.
-        
-        Args:
-            patch_len: Length of each patch
-            stride: Stride for sliding window
-        """
-        super().__init__()
+        super(Patchfy, self).__init__()
         self.patch_len = patch_len
         self.stride = stride
-
+        assert self.patch_len == self.stride, "non-overlap"
     def forward(self, x):
-        """Forward pass for patchify layer.
-        
-        Args:
-            x: Input tensor of shape (B, L, D)
-            
-        Returns:
-            torch.Tensor: Patched tensor of shape (B, N, P, D)
-        """
-        B, L, D = x.shape
-        patches = x.unfold(1, self.patch_len, self.stride)
-        return patches.permute(0, 1, 3, 2)
+        x = x.transpose(1, 2)
+        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # x = x.transpose(1, 2)
+        return x
 
 
 class Model(nn.Module):
-    """Main time series encoder model."""
-
     def __init__(self, args):
-        """Initialize time series encoder model.
-        
-        Args:
-            args: Configuration arguments
-        """
-        super().__init__()
-        self.config = args
-        self.d_model = args.d_model
-        self.n_heads = args.n_heads
-        self.e_layers = args.e_layers
-        self.patch_len = args.patch_len
-        self.stride = args.stride
-        self.input_len = args.input_len
-        self.dropout = args.dropout
-        self.model = args.model
-
-        # Patchify layer
-        self.patchify = Patchfy(self.patch_len, self.stride)
-        
-        # Positional encoding
-        self.pos_embed = LearnablePositionalEmbedding(self.d_model)
-        
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
+        super(Model, self).__init__()
+        self.patchfy = Patchfy(args.patch_len, args.stride)
+        self.layers = nn.ModuleList([
             BasicBlock(
-                dim=self.d_model,
-                num_heads=self.n_heads,
-                mlp_ratio=8.,
-                qkv_bias=False,
+                dim=args.d_model,
+                num_heads=args.n_heads,
+                mlp_ratio=4.,
+                qkv_bias=True,
                 qk_norm=False,
-                proj_drop=self.dropout,
-                attn_drop=self.dropout,
-                drop_path=0.0,
+                proj_drop=args.dropout,
+                attn_drop=args.dropout,
+                init_values=None,
+                drop_path=0.,
                 act_layer=nn.GELU,
                 norm_layer=nn.LayerNorm,
-                prefix_token_length=0,
-            )
-            for _ in range(self.e_layers)
+                prefix_token_length=0
+            ) for _ in range(args.e_layers)
         ])
-        
-        # Output normalization
-        self.norm = nn.LayerNorm(self.d_model)
-
+        self.norm = nn.LayerNorm(args.d_model)
+        self.patch_embedding = nn.Sequential(
+            nn.Linear(args.patch_len, args.d_model, bias=False),
+            nn.Dropout(args.dropout)
+        )
+        self.pretrain = getattr(args, 'pretrain', False)
+        self.min_mask_ratio = getattr(args, 'min_mask_ratio', 0.7)
+        self.max_mask_ratio = getattr(args, 'max_mask_ratio', 0.8)
+        self.proj_head = nn.Linear(args.d_model, args.patch_len)
+        # self.times_project = nn.Linear(6*args.d_model, args.d_model)
     def choose_masking(self, x, min_mask_ratio, max_mask_ratio):
-        """Choose masking strategy for training.
-        
-        Args:
-            x: Input tensor
-            min_mask_ratio: Minimum masking ratio
-            max_mask_ratio: Maximum masking ratio
-            
-        Returns:
-            torch.Tensor: Masked tensor
-        """
         # Generate a random number to decide which masking function to use
-        mask_type = torch.randint(0, 2, (1,)).item()
-        if mask_type == 0:
-            return self.random_masking(x, min_mask_ratio, max_mask_ratio)
-        else:
-            return self.random_masking(x, min_mask_ratio, max_mask_ratio)
-
+        # if torch.rand(1).item() > right_prob:
+        #     return self.random_masking(x, min_mask_ratio, max_mask_ratio)
+        # else:
+        #     return self.right_masking(x, min_mask_ratio, max_mask_ratio)
+        return self.random_masking(x,min_mask_ratio,max_mask_ratio)
+    
     def random_masking(self, x, min_mask_ratio, max_mask_ratio):
-        """Apply random masking to input tensor.
-        
-        Args:
-            x: Input tensor
-            min_mask_ratio: Minimum masking ratio
-            max_mask_ratio: Maximum masking ratio
-            
-        Returns:
-            torch.Tensor: Masked tensor
         """
-        B, N, P, D = x.shape
-        mask_ratio = torch.rand(1).item() * (max_mask_ratio - min_mask_ratio) + min_mask_ratio
-        mask_len = int(P * mask_ratio)
-        
-        # Create random mask
-        mask = torch.ones(B, N, P, D, device=x.device)
-        for b in range(B):
-            for n in range(N):
-                mask_indices = torch.randperm(P)[:mask_len]
-                mask[b, n, mask_indices, :] = 0
-        
-        return x * mask
+        Perform random masking where a specified ratio of the total V*L blocks are masked.
+        """
+        N, V, L, D = x.shape  # batch, var, length, dim
+        total_elements = V * L
 
+        mask_ratio = (min_mask_ratio+max_mask_ratio)/2
+        # Calculate the number of elements to keep based on the mask ratio
+        total_keeps = int((1 - mask_ratio) * total_elements)
+
+        # Generate a random noise array for each sample in the batch
+        noise = torch.rand(N, V, L, device=x.device)  # noise in [0, 1] for V*L blocks
+
+        # Flatten noise for easier processing
+        noise_flat = noise.view(N, V * L)
+
+        # Get indices to sort and restore noise
+        ids_shuffle = torch.argsort(noise_flat, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # Create the binary mask: 0 is keep, 1 is remove
+        # We create a range tensor and compare it with total_keeps to generate the mask
+        range_tensor = torch.arange(V * L, device=x.device).repeat(N, 1)
+        mask_flat = range_tensor >= total_keeps
+
+        # Unshuffle to get the binary mask in original order
+        mask_flat = mask_flat.gather(dim=1, index=ids_restore)
+
+        # Reshape mask back to the original V, L dimensions
+        mask = mask_flat.view(N, V, L)
+
+
+        return mask
+    
     def encode(self, x):
-        """Encode time series data.
-        
-        Args:
-            x: Input tensor of shape (B, L, D)
-            
-        Returns:
-            torch.Tensor: Encoded tensor
-        """
-        # Apply patches
-        x = self.patchify(x)  # (B, N, P, D)
-        
-        # Add positional encoding
-        x = x + self.pos_embed(x)
-        
-        # Apply transformer blocks
-        for block in self.blocks:
-            x = block(x, prefix_seq_len=0, attn_mask=None)
-        
-        # Final normalization
+        B,n_vars,N,C = x.shape
+        for layer in self.layers:
+            x = layer(x, prefix_seq_len=None, attn_mask=None)
         x = self.norm(x)
-        
+        # x = x.view(B // n_vars, n_vars , N* C)
+        # x = self.vars_project(x)
         return x
 
-    def informer_encode(self, x):
-        """Informer-style encoding.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            torch.Tensor: Encoded tensor
-        """
-        return self.encode(x)
-
-    def crossformer_encode(self, x):
-        """Crossformer-style encoding.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            torch.Tensor: Encoded tensor
-        """
-        return self.encode(x)
-
-    def patchtst_encode(self, x):
-        """PatchTST-style encoding.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            torch.Tensor: Encoded tensor
-        """
-        return self.encode(x)
 
     def forward(self, ts_values):
-        """Forward pass for time series encoder.
-        
-        Args:
-            ts_values: Time series values of shape (B, L, D)
-            
-        Returns:
-            torch.Tensor: Encoded time series features
-        """
-        # X_enc [B,L,D]
-        if self.model == 'TimeSeriesEncoder':
-            return self.encode(ts_values)
-        elif self.model == 'Informer':
-            return self.informer_encode(ts_values)
-        elif self.model == 'Crossformer':
-            return self.crossformer_encode(ts_values)
-        elif self.model == 'PatchTST':
-            return self.patchtst_encode(ts_values)
-        else:
-            raise ValueError(f"Unknown model type: {self.model}")
+        #X_enc [B,L,D]
+        x =  ts_values 
+        x = self.patchfy(x)
+        if self.pretrain:
+            orin_x = x
+            mask = self.choose_masking(x,self.min_mask_ratio, self.max_mask_ratio)
+            mask_repeat = mask.unsqueeze(dim=-1) #[B,D,N,1]
+            mask_repeat = mask_repeat.repeat(1, 1, 1, x.shape[-1])#[B,D,N,d]
+            #进行掩码
+            x = x.masked_fill(mask_repeat, 0)
+        x = self.patch_embedding(x)
+        x = self.encode(x)
+        if self.pretrain:
+            predict_x = self.proj_head(x)
+            loss = F.mse_loss(predict_x, orin_x, reduction='mean')
+            return CausalLMOutputWithPast(loss=loss, logits=x)
+        return CausalLMOutputWithPast(logits=x,loss=None)
+
+
+
+
+def test_model():
+    import yaml
+    import argparse
+
+
+    #读取args
+    parser = argparse.ArgumentParser(description='TsEncoder Pretrain')
+    parser.add_argument('--fix_seed', type=int, default=None, help='seed')
+
+    # model settings
+    parser.add_argument('--d_model', type=int, default=512,
+                        help='dimension of model')
+    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
+    parser.add_argument('--e_layers', type=int, default=4,
+                        help='num of encoder layers')
+    parser.add_argument("--patch_len", type=int, default=100)
+    parser.add_argument("--stride", type=int, default=100)
+    parser.add_argument("--input_len", type=int, default=600)
+    parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
+    parser.add_argument('--pretrain', type=bool, default=True, help='pretrain mode')
+    parser.add_argument('--min_mask_ratio', type=float, default=0.1, help='minimum mask ratio')
+    parser.add_argument('--max_mask_ratio', type=float, default=0.3, help='maximum mask ratio')
+
+    args = parser.parse_args()
+    # 创建一个Model实例
+
+    model = Model(args)
+
+    # 创建一些假的输入数据
+    x_enc = torch.randn(10, 600, 33)  # 假设有10个样本，每个样本有50个时间步，每个时间步有100个特征
+
+    # 调用forward方法
+    dec_out = model.forward(x_enc)
+
+    if 'loss' in dec_out:
+        print(f"Loss: {dec_out['loss']}")
+        print(f"Logits Shape: {dec_out['logits'].shape}")
+    else:
+        print(f"Logits Shape: {dec_out['logits'].shape}")
+
+# 在脚本的最后调用测试函数
+if __name__ == '__main__':
+    test_model()
