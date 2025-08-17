@@ -55,7 +55,7 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download(repo
 
 After downloading, organize your files as follows:
 
-```
+<pre>
 ITFormer-ICML25/
 ├── dataset/
 │   └── datasets/                    # Place EngineMT-QA dataset files here
@@ -63,16 +63,16 @@ ITFormer-ICML25/
 │       ├── train_qa.jsonl           # Training QA pairs
 │       └── test_qa.jsonl            # Test QA pairs
 ├── LLM/                             # Create this directory for base LLM models
-│   ├── Qwen2.5-0.5B-Instruct/      # Download corresponding size
-│   ├── Qwen2.5-3B-Instruct/        # Download corresponding size
-│   └── Qwen2.5-7B-Instruct/        # Download corresponding size
+│   ├── Qwen2.5-0.5B-Instruct/       # Download corresponding size
+│   ├── Qwen2.5-3B-Instruct/         # Download corresponding size
+│   └── Qwen2.5-7B-Instruct/         # Download corresponding size
 ├── checkpoints/
 │   ├── ITFormer-0.5B/               # Downloaded ITFormer-0.5B model (lightweight, beats ChatGPT-4o)
 │   ├── ITFormer-3B/                 # Downloaded ITFormer-3B model (medium)
 │   └── ITFormer-7B/                 # Downloaded ITFormer-7B model (full, best performance)
 └── yaml/
     └── infer.yaml                   # Configuration file
-```
+</pre>
 
 #### Download Base LLM Models
 
