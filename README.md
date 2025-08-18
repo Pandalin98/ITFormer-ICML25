@@ -49,9 +49,9 @@ pip install huggingface_hub
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='pandalin98/EngineMT-QA', repo_type='dataset')"
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='pandalin98/ITFormer-7B')"
 ```
-```
 
 ### 2. Organize Directory Structure
+```
 
 After downloading, organize your files as follows:
 
@@ -73,6 +73,7 @@ ITFormer-ICML25/
 └── yaml/
     └── infer.yaml                   # Configuration file
 </pre>
+```
 
 #### Download Base LLM Models
 
