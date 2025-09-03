@@ -433,8 +433,8 @@ class ITformer(nn.Module):
         cycle_index = [i for i in stage if i != 3 and i != 4]
         cross_cycle_index = [i for i in stage if i == 3 or i == 4]
 
-        cycle_memory = memory[:, cycle_index, :, :]
-        cross_cycle_memory = memory[:, cross_cycle_index, :, :]
+        cycle_memory = memory[cycle_index, :, :, :]
+        cross_cycle_memory = memory[cross_cycle_index, :, :, :]
 
         # Reshape and apply positional encoding to memory at time dimension
         b, l, v, d = cycle_memory.shape
@@ -449,7 +449,7 @@ class ITformer(nn.Module):
         cross_cycle_memory = cross_cycle_memory + self.cycle_pos(cross_cycle_memory)
         cross_cycle_memory = cross_cycle_memory.view(b, l, v, d)
 
-        memory = torch.cat([cycle_memory, cross_cycle_memory], dim=1)
+        memory = torch.cat([cycle_memory, cross_cycle_memory], dim=0)
 
         # Reshape and apply positional encoding to memory at var dimension
         b, v, l, d = memory.shape
