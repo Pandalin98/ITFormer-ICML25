@@ -260,6 +260,30 @@ If you use this code in your research, please cite:
 
 Paper: https://arxiv.org/abs/2506.20093
 
+## Troubleshooting
+
+If your inference results differ from expected values:
+
+1. **Run diagnostics**: `python diagnostics.py --full --model_checkpoint <your_checkpoint>`
+2. **Check FAQ**: See [FAQ.md](FAQ.md) for common questions
+3. **Troubleshooting guide**: See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for detailed help
+4. **Report issues**: Use the [issue template](.github/ISSUE_TEMPLATE/inference_results_discrepancy.md)
+
+Quick diagnostic checks:
+```bash
+# Check environment
+python diagnostics.py --check-environment
+
+# Verify model checkpoint
+python diagnostics.py --verify-checkpoint --model_checkpoint checkpoints/ITFormer-0.5B
+
+# Check dataset
+python diagnostics.py --check-dataset
+
+# Full diagnostic report
+python diagnostics.py --full --model_checkpoint checkpoints/ITFormer-0.5B
+```
+
 ## License
 
 MIT License — see the LICENSE file for details.

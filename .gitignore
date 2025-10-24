@@ -193,4 +193,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Diagnostic reports
+diagnostic_report.json
+
 /LLM/*
