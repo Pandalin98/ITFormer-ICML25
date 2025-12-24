@@ -7,10 +7,10 @@ stride: 60
 input_len: 600
 dropout: 0.1
 
-tt_d_model: 896
-tt_n_heads: 16
-tt_layers: 2
-tt_dropout: 0.1
+it_d_model: 896
+it_n_heads: 16
+it_layers: 2
+it_dropout: 0.1
 prefix_num: 25
 
 ts_path_test: dataset/datasets/time_series_data.h5

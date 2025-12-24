@@ -24,6 +24,7 @@ class Exp_Pretrain(Trainer):
             save_total_limit=2,
             num_train_epochs=args.num_train_epochs,
             report_to=args.report_to,  # Example: Integrate TensorBoard
+            remove_unused_columns=False,
         )
 
         super().__init__(

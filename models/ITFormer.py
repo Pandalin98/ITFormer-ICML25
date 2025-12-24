@@ -1,8 +1,6 @@
 """
-Time Text Former
+ITFormer (Instruction-aware Time Series Transformer)
 """
-import sys
-sys.path.append('/dataYYF/dataWX/SJ/Time-QA/')
 import math
 import torch
 import torch.nn.functional as F
@@ -12,6 +10,8 @@ from timm.layers.helpers import to_2tuple
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from utils.position_coding import LearnablePositionalEmbedding, SinusoidalPositionalEncoding,RotaryPositionalEncoding
 from models.layers.attention import InstructTimeAttention
+from utils.log_util import adaptive_print
+
 class SeqCrossAttention(nn.Module):
     def __init__(
             self,
@@ -388,81 +388,94 @@ class DecoderBasicBlock(nn.Module):
         return x
 
 
-class ITformer(nn.Module):
+class ITFormer(nn.Module):
     def __init__(self, args):
-        super(ITformer, self).__init__()
+        super(ITFormer, self).__init__()
         self.layers = nn.ModuleList([
             DecoderBasicBlock(
-                dim=args.tt_d_model,
-                num_heads=args.tt_n_heads,
+                dim=args.it_d_model,
+                num_heads=args.it_n_heads,
                 mlp_ratio=4.,
                 qkv_bias=True,
                 qk_norm=False,
-                proj_drop=args.tt_dropout,
-                attn_drop=args.tt_dropout,
+                proj_drop=args.it_dropout,
+                attn_drop=args.it_dropout,
                 drop_path=0.,
                 act_layer=nn.GELU,
                 norm_layer=nn.LayerNorm,
                 prefix_num=args.prefix_num
-            ) for _ in range(args.tt_layers)
+            ) for _ in range(args.it_layers)
         ])
-        self.norm = nn.LayerNorm(args.tt_d_model)
+        self.norm = nn.LayerNorm(args.it_d_model)
 
 
         #time posi
-        self.time_pos = SinusoidalPositionalEncoding(args.tt_d_model)
+        self.time_pos = SinusoidalPositionalEncoding(args.it_d_model)
         #variable posi
-        self.var_pos = LearnablePositionalEmbedding(args.tt_d_model)
+        self.var_pos = LearnablePositionalEmbedding(args.it_d_model)
         #instruction posi
-        self.instruc_pos = SinusoidalPositionalEncoding(args.tt_d_model)
+        self.instruc_pos = SinusoidalPositionalEncoding(args.it_d_model)
         # cycle posi
-        self.cycle_pos = RotaryPositionalEncoding(args.tt_d_model)
+        self.cycle_pos = RotaryPositionalEncoding(args.it_d_model)
 
         #prefix num
         self.prefix_num = args.prefix_num
-        self.prefix_token = nn.Parameter(torch.randn(1, args.prefix_num, args.tt_d_model))
+        self.prefix_token = nn.Parameter(torch.randn(1, args.prefix_num, args.it_d_model))
     def forward(self, x, memory, stage=None,attn_mask=None):
-
         # Add prefix token to x 
         x = torch.cat([self.prefix_token.repeat(x.shape[0], 1, 1), x], dim=1)
         # Positional encoding
         # Apply positional encoding to x
         x = x + self.instruc_pos(x)
 
-        #Stage是list,找出stage中等于3,4的位置
-        cycle_index = [i for i in stage if i != 3 and i != 4]
-        cross_cycle_index = [i for i in stage if i == 3 or i == 4]
+        # Stage 处理逻辑改进
+        if torch.is_tensor(stage):
+            stage_list = stage.tolist()
+        else:
+            stage_list = stage
 
-        cycle_memory = memory[cycle_index, :, :, :]
-        cross_cycle_memory = memory[cross_cycle_index, :, :, :]
+        # 找出不同 stage 的索引
+        cycle_index = [i for i, s in enumerate(stage_list) if s != 3 and s != 4]
+        cross_cycle_index = [i for i, s in enumerate(stage_list) if s == 3 or s == 4]
+        
+        # 记录原始顺序以便恢复，确保与 x 对齐
+        original_indices = cycle_index + cross_cycle_index
+        reorder_map = {idx: i for i, idx in enumerate(original_indices)}
+        reverse_indices = [reorder_map[i] for i in range(len(stage_list))]
 
-        # Reshape and apply positional encoding to memory at time dimension
-        b, l, v, d = cycle_memory.shape
-        cycle_memory = cycle_memory.view(b * l, v, d)
-        cycle_memory = cycle_memory + self.time_pos(cycle_memory)
-        cycle_memory = cycle_memory.view(b, l, v, d)
+        processed_memories = []
 
+        if len(cycle_index) > 0:
+            sub_memory = memory[cycle_index]
+            b, l, v, d = sub_memory.shape
+            sub_memory = sub_memory.view(b * l, v, d)
+            sub_memory = sub_memory + self.time_pos(sub_memory)
+            sub_memory = sub_memory.view(b, l, v, d)
+            processed_memories.append((cycle_index, sub_memory))
 
-        # Reshape and apply positional encoding to memory at cycle dimension
-        b, l, v, d = cross_cycle_memory.shape
-        cross_cycle_memory = cross_cycle_memory.view(b * v, l, d)
-        cross_cycle_memory = cross_cycle_memory + self.cycle_pos(cross_cycle_memory)
-        cross_cycle_memory = cross_cycle_memory.view(b, l, v, d)
+        if len(cross_cycle_index) > 0:
+            sub_memory = memory[cross_cycle_index]
+            b, l, v, d = sub_memory.shape
+            sub_memory = sub_memory.view(b * v, l, d)
+            sub_memory = sub_memory + self.cycle_pos(sub_memory)
+            sub_memory = sub_memory.view(b, l, v, d)
+            processed_memories.append((cross_cycle_index, sub_memory))
 
-        memory = torch.cat([cycle_memory, cross_cycle_memory], dim=0)
+        # 按照拼接后的顺序排列
+        all_processed = torch.cat([m for _, m in processed_memories], dim=0)
+        # 关键步骤：恢复原始 batch 顺序以匹配 x
+        memory = all_processed[reverse_indices]
 
-        # Reshape and apply positional encoding to memory at var dimension
-        b, v, l, d = memory.shape
+        # 再次处理变量维度
+        b, l, v, d = memory.shape
         memory = memory.view(b * l, v, d)
         memory = memory + self.var_pos(memory)
         memory = memory.view(b, l, v, d)
 
-
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x, memory, attn_mask)
+
         x = self.norm(x)
-
-
         return x[:, :self.prefix_num, :]
 
 def count_parameters(model):
@@ -491,14 +504,14 @@ if __name__ == "__main__":
     # print("DecoderBasicBlock Output Shape:", output.shape)
     # class Args:
     #     def __init__(self):
-    #         self.tt_d_model = 64
-    #         self.tt_n_heads = 8
-    #         self.tt_layers = 6
-    #         self.tt_dropout = 0.1
+    #         self.it_d_model = 64
+    #         self.it_n_heads = 8
+    #         self.it_layers = 6
+    #         self.it_dropout = 0.1
     #         self.prefix_num = 10
 
     # args = Args()
-    # model = TTformer(args)
+    # model = ITformer(args)
 
     # x = torch.randn(batch_size, seq_len, dim)
     # memory = torch.randn(batch_size, var_num, memory_len, dim)
@@ -508,14 +521,14 @@ if __name__ == "__main__":
     # print("Model Output Shape:", output.shape)
     class Args:
         def __init__(self):
-            self.tt_d_model = 512
-            self.tt_n_heads = 8
-            self.tt_layers = 4
-            self.tt_dropout = 0.1
+            self.it_d_model = 512
+            self.it_n_heads = 8
+            self.it_layers = 4
+            self.it_dropout = 0.1
             self.prefix_num = 10
 
     args = Args()
-    model = ITformer(args)
+    model = ITFormer(args)
 
     # 打印可训练参数量
     total_trainable_params = count_parameters(model)

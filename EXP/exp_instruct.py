@@ -22,7 +22,6 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 from accelerate import Accelerator
 accelerator = Accelerator()
-from models.TimeLanguageModel import GradientAndActivationMonitor 
 import torch.distributed as dist    
 from datetime import datetime
 
@@ -76,6 +75,7 @@ class Exp_Instruct(Trainer):
             report_to=args.report_to,  # Example: Integrate TensorBoard
             prediction_loss_only=False,
             max_grad_norm=0.1,
+            remove_unused_columns=False,
             dataloader_drop_last=True)
 
         super().__init__(
@@ -100,9 +100,9 @@ class Exp_Instruct(Trainer):
         # 定义stage权重
         self.stage_weights = {
             1: 1.0,   # 开放式问题 - 基础权重
-            2: 1.5,   # 封闭式问题 - 稍高权重
-            3: 1.5,   # 封闭式问题 - 中等权重
-            4: 1.1    # 开放式问题 - 稍低权重
+            2: 1.0,   # 封闭式问题 - 稍高权重
+            3: 1.0,   # 封闭式问题 - 中等权重
+            4: 1.0    # 开放式问题 - 稍低权重
         }
         # 初始化损失函数，不使用ignore_index（我们将手动处理）
         self.base_loss_fn = nn.CrossEntropyLoss(reduction='none', ignore_index=self.padding_idx)
@@ -113,17 +113,7 @@ class Exp_Instruct(Trainer):
     def _build_model(self, args):
         """Load the model dynamically based on the configuration."""
         # self.tlmconfig = TLMConfig(llm_model_path = args.llm_model_path)
-        model = TLM(self.tlmconfig,args).cuda()
-        if accelerator.is_main_process:
-            # 输出模型结构
-            print("模型结构：")
-            print(model)
-
-            # 计算并输出可训练参数量（以百万为单位）
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            trainable_params_m = trainable_params / 1e6  # 转换为百万（M）
-
-            print(f"模型训练参数量为：{trainable_params_m:.2f}M")
+        model = TLM(self.tlmconfig, ts_config=args).cuda()
         # monitor = GradientAndActivationMonitor(model,track_outputs=False,verbose=True)
         return model
     
@@ -179,16 +169,6 @@ class Exp_Instruct(Trainer):
                 output_hidden_states=False,     # 不输出隐藏状态
                 return_dict_in_generate=False,  # 简化返回格式
             )
-        end_time = time.time()
-        if accelerator.is_main_process:
-            # generated_ids = output[:, input_ids.shape[1]:]
-            print(f"[生成耗时] {end_time - start_time:.2f} 秒")
-            # 解码输出为文字
-            try:
-                generated_text = self.processor.decode(output[0], skip_special_tokens=True)
-                print(f"[生成结果] {generated_text}")
-            except Exception as e:
-                print(f"[错误] 无法解码 generated_ids: {e}")
         return output
     def generate(
         self,
@@ -244,8 +224,9 @@ class Exp_Instruct(Trainer):
             "num_samples": sample_num
         }
 
-        with open('output_result_all.json', 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=4, ensure_ascii=False)
+        if accelerator.is_main_process:
+            with open('output_result_all.json', 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=4, ensure_ascii=False)
 
         pred_extra = {'stages': stages}
         avg_loss = np.mean(all_losses) if all_losses else None

@@ -52,5 +52,13 @@ def log_in_local_rank_0(*msg, type='info', used_logger=None):
             used_logger.info(msg)
 
 
+def adaptive_print(*args, **kwargs):
+    """
+    仅在主进程打印的 print 函数。
+    """
+    if is_local_rank_0():
+        print(*args, **kwargs)
+
+
 # -------------------------- Singleton Object --------------------------
 logger = get_logger(DEFAULT_LOGGER)

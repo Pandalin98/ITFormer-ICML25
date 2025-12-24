@@ -16,12 +16,27 @@ import pandas as pd
 import numpy as np
 import h5py
 import re
+import random
 from models.TimeLanguageModel import TLMConfig
-from accelerate import Accelerator
+from utils.log_util import adaptive_print
 
-# Get accelerator instance for main process checks
-accelerator = Accelerator()
+class PretrainDataset(Dataset):
 
+    def __init__(self, ts_path):
+        super().__init__()
+        self.ts_path = ts_path
+        self.load_data()
+
+    def load_data(self):
+        with h5py.File(self.ts_path, 'r') as f:
+            data = f['seq_data'][:]
+        self.datas = data
+        
+    def __len__(self):
+        return len(self.datas)
+
+    def __getitem__(self, index):
+        return {'ts_values': torch.tensor(self.datas[index], dtype=torch.float)}
 
 def find_assistant_tokens(tokenizer, target):
     """Find assistant token positions in the target sequence.
@@ -51,7 +66,7 @@ def find_assistant_tokens(tokenizer, target):
 class TsQaDataset(Dataset):
     """Time Series Question Answering Dataset with token ID range validation."""
     
-    def __init__(self, ts_path, data_path, tokenizer, processor, config, pretrain=False, sft=False):
+    def __init__(self, ts_path, data_path, tokenizer, processor, config, pretrain=False, sft=False, shuffle=False):
         """Initialize the dataset.
         
         Args:
@@ -62,6 +77,7 @@ class TsQaDataset(Dataset):
             config: Configuration object
             pretrain: Whether in pretraining mode
             sft: Whether in supervised fine-tuning mode
+            shuffle: Whether to shuffle the data
         """
         super().__init__()
         self.ts_path = ts_path
@@ -71,12 +87,12 @@ class TsQaDataset(Dataset):
         self.config = config
         self.pretrain = pretrain
         self.sft = sft
+        self.shuffle = shuffle
         self.h5_file = None
         
         # Key fix: Ensure vocab_size is correct
         self.vocab_size = len(self.tokenizer)
-        if accelerator.is_main_process:
-            accelerator.print(f"📊 Vocab size: {self.vocab_size}")
+        adaptive_print(f"📊 Vocab size: {self.vocab_size}")
         
         # Ensure tokenizer settings are consistent
         self.tokenizer.padding_side = 'left'
@@ -96,21 +112,17 @@ class TsQaDataset(Dataset):
             'unk_token_id': getattr(self.tokenizer, 'unk_token_id', None),
         }
         
-        if accelerator.is_main_process:
-            accelerator.print("🔍 Validating special tokens:")
+        adaptive_print("🔍 Validating special tokens:")
         for name, token_id in special_tokens.items():
             if token_id is not None:
                 if token_id >= self.vocab_size or token_id < 0:
-                    if accelerator.is_main_process:
-                        accelerator.print(f"❌ {name} = {token_id} out of range [0, {self.vocab_size})")
+                    adaptive_print(f"❌ {name} = {token_id} out of range [0, {self.vocab_size})")
                     # Fix invalid special tokens
                     if name == 'pad_token_id':
                         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                        if accelerator.is_main_process:
-                            accelerator.print(f"🔧 Fixed: pad_token_id -> {self.tokenizer.pad_token_id}")
+                        adaptive_print(f"🔧 Fixed: pad_token_id -> {self.tokenizer.pad_token_id}")
                 else:
-                    if accelerator.is_main_process:
-                        accelerator.print(f"✅ {name} = {token_id}")
+                    adaptive_print(f"✅ {name} = {token_id}")
 
     def _validate_token_ids(self, token_ids, context=""):
         """Validate token IDs for validity.
@@ -128,8 +140,7 @@ class TsQaDataset(Dataset):
         valid_ids = []
         for i, token_id in enumerate(token_ids):
             if token_id < 0 or token_id >= self.vocab_size:
-                if accelerator.is_main_process:
-                    accelerator.print(f"⚠️ {context} position {i}: invalid token_id {token_id}, replacing with unk_token")
+                adaptive_print(f"⚠️ {context} position {i}: invalid token_id {token_id}, replacing with unk_token")
                 # Replace with unk_token, if not available use eos_token
                 replacement = getattr(self.tokenizer, 'unk_token_id', self.tokenizer.eos_token_id)
                 valid_ids.append(replacement)
@@ -153,6 +164,10 @@ class TsQaDataset(Dataset):
                             'answer': item['conversations'][i + 1]['value'],
                             'line_num': line_num
                         })
+        
+        if self.shuffle:
+            adaptive_print(f"🎲 Shuffling dataset: {self.data_path}")
+            random.shuffle(self.datas)
 
     def _get_h5_file(self):
         """Get HDF5 file handle for time series data."""
@@ -195,8 +210,7 @@ class TsQaDataset(Dataset):
             chat_text = chat_text.replace('<ts>', '<|image_pad|>' * self.config.ts_pad_num)
             return chat_text
         except Exception as e:
-            if accelerator.is_main_process:
-                accelerator.print(f"❌ Chat template error: {e}")
+            adaptive_print(f"❌ Chat template error: {e}")
             # Fallback to a simple format
             return f"You are a helpful assistant.\nuser\n{question}\nassistant\n"
 
@@ -218,9 +232,8 @@ class TsQaDataset(Dataset):
             return token_ids
             
         except Exception as e:
-            if accelerator.is_main_process:
-                accelerator.print(f"❌ Tokenization error for text: {text[:100]}...")
-                accelerator.print(f"Error: {e}")
+            adaptive_print(f"❌ Tokenization error for text: {text[:100]}...")
+            adaptive_print(f"Error: {e}")
             # Return a safe default value
             return [self.tokenizer.eos_token_id]
 
@@ -313,8 +326,7 @@ class TsQaDataset(Dataset):
                 }
                 
         except Exception as e:
-            if accelerator.is_main_process:
-                accelerator.print(f"❌ Error processing sample {idx}: {e}")
+            adaptive_print(f"❌ Error processing sample {idx}: {e}")
             # Return a safe default sample
             return self._get_safe_default_sample()
 
@@ -340,11 +352,23 @@ class DataCollator:
         self.tokenizer = tokenizer
         # Ensure tokenizer settings are correct
         if self.tokenizer.padding_side != 'left':
-            if accelerator.is_main_process:
-                accelerator.print("⚠️  Warning: Setting tokenizer.padding_side to 'left' for decoder-only model")
+            adaptive_print("⚠️  Warning: Setting tokenizer.padding_side to 'left' for decoder-only model")
             self.tokenizer.padding_side = 'left'
     
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # 兼容性处理：检查 key 是否存在，如果不存在（如预训练模式）则跳过相关逻辑
+        has_text_data = all('input_ids' in f and 'labels' in f and 'query_ids' in f for f in features)
+        
+        if not has_text_data:
+            # 预训练模式或数据缺失：仅处理 ts_values
+            ts_values = [f['ts_values'] for f in features]
+            batch = {'ts_values': torch.stack(ts_values, dim=0)}
+            # 尝试包含其他可能存在的字段
+            for key in ['stage', 'index']:
+                if all(key in f for f in features):
+                    batch[key] = torch.tensor([f[key] for f in features])
+            return batch
+
         max_len_inputs = max(len(feature['input_ids']) for feature in features)
         max_len_labels = max(len(feature['labels']) for feature in features)
         max_len_querys = max(len(feature['query_ids']) for feature in features)    

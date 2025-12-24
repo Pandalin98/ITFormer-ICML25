@@ -66,10 +66,13 @@ class CrossAttention(nn.Module):
         k, v = kv.unbind(0)
         k = self.k_norm(k)
 
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.attn_drop.p if self.training else 0.,
-        )
+        # Ensure memory continuity and use stable attention backend to prevent CUDA illegal memory access
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
 
         x = x.transpose(1, 2).reshape(B, var_num, C)
         x = self.proj(x)
@@ -180,10 +183,14 @@ class SeqAttention(nn.Module):
                                   self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        x = F.scaled_dot_product_attention(
-            q, k, v,  # attn_mask=attn_mask,
-            dropout_p=self.attn_drop.p if self.training else 0.,
-        )
+
+        # Ensure memory continuity and use stable attention backend to prevent CUDA illegal memory access
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            x = F.scaled_dot_product_attention(
+                q, k, v,  # attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -227,10 +234,13 @@ class VarAttention(nn.Module):
         k = k.mean(dim=1, keepdim=False)
         v = v.permute(0, 2, 3, 4, 1).reshape(B, self.num_heads, N, -1)
 
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.attn_drop.p if self.training else 0.,
-        )
+        # Ensure memory continuity and use stable attention backend to prevent CUDA illegal memory access
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
 
         # Robust reshape to handle dimension mismatches  
         # Expected: x has shape [B, num_heads, N, P * head_dim]
