@@ -1,5 +1,17 @@
 import warnings
 warnings.simplefilter("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*TRANSFORMERS_CACHE.*")
+import os
+import logging
+from transformers.utils import logging as transformers_logging
+
+# 只在主进程显示进度条和日志
+if os.environ.get("LOCAL_RANK", "0") == "0":
+    transformers_logging.set_verbosity_info()
+else:
+    transformers_logging.set_verbosity_error()
+    logging.disable(logging.CRITICAL)
+
 from transformers import  AutoTokenizer
 from transformers import AutoProcessor
 import torch.nn as nn
@@ -9,10 +21,11 @@ import argparse
 from models.TimeLanguageModel import TLMConfig
 import swanlab as wandb
 from EXP.exp_pretraining import Exp_Pretrain
-
+from accelerate import Accelerator
 
 if __name__ == '__main__':
-
+    accelerator = Accelerator()
+    
     #读取args
     parser = argparse.ArgumentParser(description='TsEncoder Pretrain')
     parser.add_argument('--fix_seed', type=int, default=None, help='seed')
@@ -60,12 +73,13 @@ if __name__ == '__main__':
 
     ##data setting
     tlmconfig = TLMConfig(llm_model_path = 'LLM/Qwen2.5-0.5B-Instruct')
-    ts_path = 'dataset/dataset_for_upload_modelscope/data_merged_new.h5'
+    ts_path = 'dataset/datasets/time_series_data.h5'
     tokenizer = AutoTokenizer.from_pretrained(tlmconfig.llm_model_path)
     processor = AutoProcessor.from_pretrained(tlmconfig.llm_model_path)
     dataset = PretrainDataset(ts_path)
 
-    wandb.init(mode="offline",project="TSLLM-TsEncoder", name="XXX")
+    if accelerator.is_main_process:
+        wandb.init(mode="offline",project="TSLLM-TsEncoder", name="XXX")
 
     Trainer = Exp_Pretrain(args, dataset)
 

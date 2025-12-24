@@ -1,11 +1,13 @@
 from transformers import PreTrainedModel, PretrainedConfig, AutoTokenizer, AutoModelForCausalLM
 from transformers import AutoProcessor, AutoModel
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*TRANSFORMERS_CACHE.*")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Trainer, TrainingArguments, DataCollatorWithPadding
-from dataset.dataset_debug import TsQaDataset,DataCollator
+from dataset.dataset import TsQaDataset,DataCollator
 import argparse
 from models.TimeLanguageModel import TLMConfig, TLM
 import os
@@ -17,8 +19,19 @@ import os
 import random
 import numpy as np
 import sys
+import logging
+from transformers.utils import logging as transformers_logging
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["WANDB_MODE"] = "offline"
+
+# 设置日志级别，主进程显示进度，从进程静默
+if os.environ.get("LOCAL_RANK", "0") == "0":
+    transformers_logging.set_verbosity_info()
+else:
+    transformers_logging.set_verbosity_error()
+    logging.disable(logging.CRITICAL)
+
 # # 启用异常检测
 
 if __name__ == '__main__':
@@ -40,11 +53,11 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--load_ts_encoder', type=str, default='save/pretrain/model.safetensors', help='load ts_encoder')
 
-    #TT-Former setting
-    parser.add_argument('--tt_d_model', type=int, default=896, help='dimension of TT model')
-    parser.add_argument('--tt_n_heads', type=int, default=16, help='num of TT heads')
-    parser.add_argument('--tt_layers', type=int, default=2, help='num of TT layers')
-    parser.add_argument('--tt_dropout', type=float, default=0.1, help='dropout for TT model')
+    #ITFormer setting
+    parser.add_argument('--it_d_model', type=int, default=896, help='dimension of IT model')
+    parser.add_argument('--it_n_heads', type=int, default=16, help='num of IT heads')
+    parser.add_argument('--it_layers', type=int, default=2, help='num of IT layers')
+    parser.add_argument('--it_dropout', type=float, default=0.1, help='dropout for IT model')
     parser.add_argument('--prefix_num', type=int, default=25, help='number of prefixes')
 
     #LLM setting
@@ -77,9 +90,10 @@ if __name__ == '__main__':
     parser.add_argument('--logging_steps', type=int, default=50, help='log every X updates steps')
     parser.add_argument('--eval_steps', type=int, default=300000000000000000, help='eval every X updates steps')
 
-    parser.add_argument('--report_to', type=str, default="wandb", help='report results to')
+    parser.add_argument('--report_to', type=str, default="swandb", help='report results to')
     parser.add_argument('--mode', type=str, default='train', help='inference or train')
     parser.add_argument('--eval_stragy',type=str,default="no",help='The evaluation strategy to adopt during training')
+    parser.add_argument('--shuffle', type=bool, default=True, help='whether to shuffle the dataset')
 
 
     args = parser.parse_args()
@@ -102,16 +116,16 @@ if __name__ == '__main__':
                           ts_pad_num=args.prefix_num)
     
     ts_past_train = 'dataset/datasets/time_series_data.h5'
-    qa_past_train = 'dataset/datasets/train_QA.jsonl'
+    qa_past_train = 'dataset/datasets/train_qa.jsonl'
     
     ts_path_test = 'dataset/datasets/time_series_data.h5'
-    qa_path_test = 'dataset/datasets/test_QA.jsonl'
+    qa_path_test = 'dataset/datasets/test_qa.jsonl'
 
     tokenizer = AutoTokenizer.from_pretrained(tlmconfig.llm_model_path)
     tokenizer.padding_side = 'left'
     processor = AutoProcessor.from_pretrained(tlmconfig.llm_model_path)
     train_dataset = TsQaDataset(ts_past_train, qa_past_train, 
-                          tokenizer, processor, tlmconfig,sft=True)
+                          tokenizer, processor, tlmconfig,sft=True, shuffle=args.shuffle)
     test_dataset = TsQaDataset(ts_path_test, qa_path_test,
                             tokenizer, processor, tlmconfig)
 

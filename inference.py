@@ -7,8 +7,12 @@ Performs inference on the test set and saves results and evaluation metrics.
 import os
 import yaml
 import json
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*TRANSFORMERS_CACHE.*")
 import argparse
 import random
+import logging
+from transformers.utils import logging as transformers_logging
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoProcessor
@@ -58,9 +62,17 @@ def count_model_parameters(model):
 
 def main_inference(args):
     """Main inference pipeline."""
-    set_seed(args.seed)
     # Initialize accelerator
     accelerator = Accelerator()
+    
+    # 设置日志级别，主进程显示进度，从进程静默
+    if accelerator.is_local_main_process:
+        transformers_logging.set_verbosity_info()
+    else:
+        transformers_logging.set_verbosity_error()
+        logging.disable(logging.CRITICAL)
+
+    set_seed(args.seed)
     # Print only in the main process
     if accelerator.is_main_process:
         print("🚀 Starting inference process...")
@@ -86,6 +98,9 @@ def main_inference(args):
         # Default to 7B if size cannot be determined
         llm_model_path = 'LLM/Qwen2.5-7B-Instruct'
     
+    # 将推断出的 llm_model_path 存入 args，防止后续 compute_metrics_from_results 报错
+    args.llm_model_path = llm_model_path
+    
     if accelerator.is_main_process:
         print(f"🔗 Using LLM model: {llm_model_path}")
     
@@ -93,12 +108,25 @@ def main_inference(args):
     tlm_config = TLMConfig(
         llm_model_path=llm_model_path,
         freeze_ts_model=True,
-        ts_pad_num=args.prefix_num
+        ts_pad_num=args.prefix_num,
+        # 显式补全 ITFormer 和 TS Encoder 需要的字段名
+        prefix_num=args.prefix_num,
+        it_d_model=config.get('it_d_model', 896),
+        it_n_heads=config.get('it_n_heads', 16),
+        it_layers=config.get('it_layers', 2),
+        it_dropout=config.get('it_dropout', 0.1),
+        dropout=config.get('dropout', 0.1),
+        d_model=config.get('d_model', 512),
+        n_heads=config.get('n_heads', 8),
+        e_layers=config.get('e_layers', 4),
+        patch_len=config.get('patch_len', 60),
+        stride=config.get('stride', 60),
+        input_len=config.get('input_len', 600),
     )
     
     # Load model - let from_pretrained handle configuration loading
     from models.TimeLanguageModel import TLM
-    model = TLM.from_pretrained(args.model_checkpoint, config=tlm_config)
+    model = TLM.from_pretrained(args.model_checkpoint, config=tlm_config, ts_config=tlm_config)
     # Print model parameter statistics only in the main process
     if accelerator.is_main_process:
         param_counts = count_model_parameters(model)
@@ -166,7 +194,10 @@ def main_inference(args):
             # if batch_idx ==16:
             #     break
             # Data is already on the correct device thanks to accelerator
-            generated_ids = model.generate(
+            
+            # 使用 unwrap_model 来调用原始模型的 generate 方法
+            unwrapped_model = accelerator.unwrap_model(model)
+            generated_ids = unwrapped_model.generate(
                 input_ids=batch['input_ids'],
                 query_ids=batch['query_ids'],
                 ts_values=batch['ts_values'],
@@ -210,8 +241,27 @@ def main_inference(args):
                 })
     if accelerator.is_main_process:
         print("\n📊 Calculating evaluation metrics...")
-    metrics = compute_metrics_from_results(results,args)
+    
+    # 汇总所有进程的结果
+    all_results = [None] * accelerator.num_processes
+    # 使用 gather_object 汇总 list
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.all_gather_object(all_results, results)
+        # 将嵌套列表打平
+        results = [item for sublist in all_results for item in sublist]
+    
     if accelerator.is_main_process:
+        # 去重（防止分布式采样导致的重复数据）
+        seen_indices = set()
+        unique_results = []
+        for r in results:
+            if r['index'] not in seen_indices:
+                unique_results.append(r)
+                seen_indices.add(r['index'])
+        results = sorted(unique_results, key=lambda x: x['index'])
+
+        metrics = compute_metrics_from_results(results, args)
         print_metrics(metrics)
         config_base = os.path.basename(args.config).split('.yaml')[0]
         save_results(results, args.output_dir, config_base)

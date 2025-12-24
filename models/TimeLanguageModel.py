@@ -12,7 +12,7 @@ from transformers import PreTrainedModel, PretrainedConfig, AutoTokenizer, AutoM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from safetensors.torch import load_file
 from models.TimeSeriesEncoder import Model
-from models.TT_Former import ITformer
+from models.ITFormer import ITFormer
 from accelerate import Accelerator
 
 accelerator = Accelerator()
@@ -51,7 +51,7 @@ class TLM(PreTrainedModel, GenerationMixin):
         Args:
             pretrained_model_name_or_path: Path to the checkpoint
             config: Model configuration
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments, including ts_config
             
         Returns:
             TLM: Loaded model instance
@@ -70,8 +70,8 @@ class TLM(PreTrainedModel, GenerationMixin):
             if config is None:
                 config = TLMConfig()
 
-        # Create model instance
-        model = cls(config)
+        # Create model instance with potential ts_config from kwargs
+        model = cls(config, **kwargs)
 
         # Load model weights
         model_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
@@ -131,33 +131,42 @@ class TLM(PreTrainedModel, GenerationMixin):
 
         return model
 
-    def __init__(self, config):
+    def __init__(self, config, ts_config=None):
         """Initialize TLM model.
         
         Args:
             config: TLM configuration
+            ts_config: Optional time series configuration (args)
         """
         super().__init__(config)
         self.config = config
         
-        # Create default ts_config
-        class TSConfig:
-            def __init__(self):
-                self.model = 'TimeSeriesEncoder'
-                self.d_model = 512
-                self.n_heads = 8
-                self.e_layers = 4
-                self.patch_len = 60
-                self.stride = 60
-                self.input_len = 600
-                self.dropout = 0.1
-                self.tt_d_model = 896
-                self.tt_n_heads = 16
-                self.tt_layers = 2
-                self.tt_dropout = 0.1
-                self.prefix_num = 25
-        ts_config = TSConfig()
+        if ts_config is None:
+            # Create default ts_config if not provided
+            class DefaultTSConfig:
+                def __init__(self):
+                    self.model = 'TimeSeriesEncoder'
+                    self.d_model = 512
+                    self.n_heads = 8
+                    self.e_layers = 4
+                    self.patch_len = 60
+                    self.stride = 60
+                    self.input_len = 600
+                    self.dropout = 0.1
+                    self.it_d_model = 896
+                    self.it_n_heads = 16
+                    self.it_layers = 2
+                    self.it_dropout = 0.1
+                    self.prefix_num = 25
+            ts_config = DefaultTSConfig()
+        
         self.ts_config = ts_config
+        
+        # 统一属性名对齐逻辑：确保 ts_pad_num 和 prefix_num 存在且一致
+        if hasattr(self.ts_config, 'ts_pad_num') and not hasattr(self.ts_config, 'prefix_num'):
+            setattr(self.ts_config, 'prefix_num', self.ts_config.ts_pad_num)
+        elif hasattr(self.ts_config, 'prefix_num') and not hasattr(self.ts_config, 'ts_pad_num'):
+            setattr(self.ts_config, 'ts_pad_num', self.ts_config.prefix_num)
         
         # Initialize LLM model from external path
         try:
@@ -178,15 +187,67 @@ class TLM(PreTrainedModel, GenerationMixin):
         
         # Initialize components
         self.ts_encoder = Model(ts_config)
-        self.itformer = ITformer(ts_config)
+        
+        # 加载预训练的 TS Encoder 权重
+        load_path = getattr(ts_config, 'load_ts_encoder', None)
+        if load_path and os.path.exists(load_path):
+            if accelerator.is_main_process:
+                from utils.log_util import adaptive_print
+                adaptive_print(f"📥 Loading pre-trained TimeSeries Encoder from: {load_path}")
+            
+            try:
+                if load_path.endswith('.safetensors'):
+                    from safetensors.torch import load_file
+                    ts_state_dict = load_file(load_path)
+                else:
+                    ts_state_dict = torch.load(load_path, map_location='cpu')
+                
+                # 兼容性处理：如果权重包含前缀，进行移除
+                new_state_dict = {}
+                for k, v in ts_state_dict.items():
+                    if k.startswith('model.'):
+                        new_state_dict[k[6:]] = v
+                    else:
+                        new_state_dict[k] = v
+                
+                msg = self.ts_encoder.load_state_dict(new_state_dict, strict=False)
+                if accelerator.is_main_process:
+                    adaptive_print(f"✅ TS Encoder weights loaded. Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    adaptive_print(f"❌ Failed to load TS Encoder weights: {e}")
+        elif load_path:
+            if accelerator.is_main_process:
+                from utils.log_util import adaptive_print
+                adaptive_print(f"⚠️ Warning: TS Encoder load path '{load_path}' does not exist. Using random initialization.")
+
+        self.itformer = ITFormer(ts_config)
         
         # Projection layers
-        self.ts_project = nn.Linear(ts_config.d_model, ts_config.tt_d_model)
-        self.query_project = nn.Linear(ts_config.llm_d_model, ts_config.tt_d_model)
-        self.fusion_project = nn.Linear(ts_config.tt_d_model, ts_config.llm_d_model)
+        self.ts_project = nn.Linear(ts_config.d_model, ts_config.it_d_model)
+        self.query_project = nn.Linear(ts_config.llm_d_model, ts_config.it_d_model)
+        self.fusion_project = nn.Linear(ts_config.it_d_model, ts_config.llm_d_model)
         
-        # Set inference mode
-        self._setup_inference_mode()
+        # 根据配置冻结参数
+        self._freeze_layers()
+
+    def _freeze_layers(self):
+        """根据配置冻结特定层，保留中间件的可训练性。"""
+        # 1. 强制冻结 LLM (通常 SFT 只训练适配器)
+        if self.llm_model is not None:
+            for param in self.llm_model.parameters():
+                param.requires_grad = False
+
+        # 2. 根据配置冻结 TS Encoder
+        if self.config.freeze_ts_model:
+            for param in self.ts_encoder.parameters():
+                param.requires_grad = False
+        else:
+            pass
+
+        # 3. 确保中间件是可训练的 (ITFormer 和 Projections)
+        # 这些层默认 requires_grad=True，所以不需要额外操作，
+        # 除非之前调用了 _setup_inference_mode()
 
     def _setup_inference_mode(self):
         """Set inference mode, freeze all parameters."""
@@ -247,12 +308,12 @@ class TLM(PreTrainedModel, GenerationMixin):
         ts_embeds = self.ts_encoder(ts_values).logits
         ts_embeds = self.ts_project(ts_embeds)
         query_embeds_f = self.query_project(query_embeds)
-        tt_embeds = self.itformer(query_embeds_f, ts_embeds, stage)
-        tt_embeds = self.fusion_project(tt_embeds)
+        it_embeds = self.itformer(query_embeds_f, ts_embeds, stage)
+        it_embeds = self.fusion_project(it_embeds)
         
         # Generate inputs_embeds
         inputs_embeds = self.llm_model.get_input_embeddings()(input_ids)
-        inputs_embeds = self.merge_input_ids_with_ts_features(tt_embeds, inputs_embeds, input_ids)
+        inputs_embeds = self.merge_input_ids_with_ts_features(it_embeds, inputs_embeds, input_ids)
 
         return {
             "inputs_embeds": inputs_embeds,
@@ -261,7 +322,7 @@ class TLM(PreTrainedModel, GenerationMixin):
 
     def forward(self, input_ids=None, query_ids=None, 
                 ts_values=None, inputs_embeds=None, stage=None, index=None,
-                attention_mask=None, past_key_values=None, **kwargs):
+                attention_mask=None, past_key_values=None, labels=None, **kwargs):
         """Forward pass of the model.
         
         Args:
@@ -273,6 +334,7 @@ class TLM(PreTrainedModel, GenerationMixin):
             index: Sample index
             attention_mask: Attention mask
             past_key_values: Past key values for caching
+            labels: Ground truth labels for loss calculation
             **kwargs: Additional arguments
             
         Returns:
@@ -285,10 +347,10 @@ class TLM(PreTrainedModel, GenerationMixin):
             ts_embeds = self.ts_encoder(ts_values).logits
             ts_embeds = self.ts_project(ts_embeds)
             query_embeds_f = self.query_project(query_embeds)
-            tt_embeds = self.itformer(query_embeds_f, ts_embeds, stage)
-            tt_embeds = self.fusion_project(tt_embeds)
+            it_embeds = self.itformer(query_embeds_f, ts_embeds, stage)
+            it_embeds = self.fusion_project(it_embeds)
             inputs_embeds = self.llm_model.get_input_embeddings()(input_ids)
-            inputs_embeds = self.merge_input_ids_with_ts_features(tt_embeds, inputs_embeds, input_ids)
+            inputs_embeds = self.merge_input_ids_with_ts_features(it_embeds, inputs_embeds, input_ids)
 
         # Forward through LLM
         outputs = self.llm_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, 
