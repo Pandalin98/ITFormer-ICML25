@@ -194,6 +194,7 @@ cython_debug/
 .cursorindexingignore
 
 /LLM/*
-
+LLM/Qwen2.5-0.5B-Instruct
 /save/*
 *.txt
+/output/*
