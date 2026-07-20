@@ -7,26 +7,75 @@ from transformers.trainer_utils import EvalPrediction
 from transformers.trainer_callback import TrainerCallback
 import os
 import torch
-from models.TimeLanguageModel import TLM, TLMConfig
-from dataset.dataset import DataCollator
 from typing import Dict, List, Any, NamedTuple, Optional, Tuple, Union
-from datasets import load_metric
 import numpy as np
-from utils.metrics import open_question_metrics,closed_question_metrics,compute_rul
 import warnings
 from tqdm import tqdm
 import pickle
 from torch import nn
-import pandas as pd
-import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
-from accelerate import Accelerator
-accelerator = Accelerator()
 import torch.distributed as dist    
 from datetime import datetime
+from utils.result_utils import dataset_sample_indices, merge_unique_results
+
+
+def gather_and_merge_eval_results(
+    local_results: List[Dict[str, Any]],
+    expected_num_samples: Optional[int] = None,
+    expected_indices: Optional[List[int]] = None,
+    distributed=None,
+) -> List[Dict[str, Any]]:
+    """Gather every rank and deduplicate only sampler-padding QA indices."""
+    distributed = dist if distributed is None else distributed
+    result_groups = [local_results]
+    if distributed.is_available() and distributed.is_initialized():
+        result_groups = [None] * distributed.get_world_size()
+        distributed.all_gather_object(result_groups, local_results)
+
+    merged_results = merge_unique_results(result_groups)
+    actual_indices = [item["index"] for item in merged_results]
+    if expected_indices is not None:
+        normalized_expected_indices = sorted(int(index) for index in expected_indices)
+        if actual_indices != normalized_expected_indices:
+            missing = sorted(set(normalized_expected_indices) - set(actual_indices))
+            unexpected = sorted(set(actual_indices) - set(normalized_expected_indices))
+            raise RuntimeError(
+                "Distributed evaluation returned the wrong QA index set. "
+                f"Missing indices: {missing[:10]}; unexpected indices: "
+                f"{unexpected[:10]}."
+            )
+    if (
+        expected_num_samples is not None
+        and len(merged_results) != expected_num_samples
+    ):
+        raise RuntimeError(
+            "Distributed evaluation produced "
+            f"{len(merged_results)} unique QA results, expected "
+            f"{expected_num_samples}. Check rank gathering, eval drop_last, "
+            "and flattened QA indices."
+        )
+    return merged_results
+
+
+def build_eval_loop_output(
+    merged_results: List[Dict[str, Any]],
+    num_samples: int,
+) -> "EvalLoopOutput":
+    """Build the same prediction/label/stage inputs used by inference metrics."""
+    return EvalLoopOutput(
+        predictions=[item["prediction"] for item in merged_results],
+        label_ids=[item["label"] for item in merged_results],
+        metrics=None,
+        num_samples=num_samples,
+        pred_extra={
+            "stages": [item["stage"] for item in merged_results],
+            "indices": [item["index"] for item in merged_results],
+        },
+    )
+
 
 def distributed_tqdm(iterable, desc=None):
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
         return tqdm(iterable, desc=desc)
     else:
         return iterable
@@ -50,6 +99,8 @@ class EvalLoopOutput(NamedTuple):
 
 class Exp_Instruct(Trainer):
     def __init__(self, args, train_dataset, tlm_config=None, eval_dataset=None):
+        from dataset.dataset import DataCollator
+
         # Build the model
         self.tlmconfig = tlm_config
         model = self._build_model(args)
@@ -70,7 +121,8 @@ class Exp_Instruct(Trainer):
             eval_steps=args.eval_steps,
             save_total_limit=args.save_total_limit,
             ddp_find_unused_parameters=False,  
-            fp16=args.fp16,  
+            fp16=args.fp16 and not getattr(args, "bf16", False),
+            bf16=getattr(args, "bf16", False),
             num_train_epochs=args.num_train_epochs,
             report_to=args.report_to,  # Example: Integrate TensorBoard
             prediction_loss_only=False,
@@ -108,10 +160,29 @@ class Exp_Instruct(Trainer):
         self.base_loss_fn = nn.CrossEntropyLoss(reduction='none', ignore_index=self.padding_idx)
         # self.args.remove_unused_columns = True  # 添加这一行
     def load_model(self, checkpoint_path):
-        self.model = TLM.from_pretrained(checkpoint_path, config=self.tlmconfig, ts_config=self.tlmargs).cuda()
+        from models.TimeLanguageModel import TLM
+
+        loaded_model = TLM.from_pretrained(
+            checkpoint_path,
+            config=self.tlmconfig,
+            ts_config=self.tlmargs,
+        ).cuda()
+        # ``Trainer`` was initialized with a different model instance.  The
+        # eval-only checkpoint must therefore be prepared *after* replacement,
+        # otherwise generation silently runs in FP32 while standalone
+        # inference uses Accelerate's configured BF16/FP16 forward wrapper.
+        self.model = self.accelerator.prepare_model(
+            loaded_model,
+            evaluation_mode=True,
+        )
+        self.model_wrapped = self.model
+        self.processor = self.accelerator.unwrap_model(self.model).tokenizer
+        self.padding_idx = self.processor.pad_token_id
 
     def _build_model(self, args):
         """Load the model dynamically based on the configuration."""
+        from models.TimeLanguageModel import TLM
+
         # self.tlmconfig = TLMConfig(llm_model_path = args.llm_model_path)
         model = TLM(self.tlmconfig, ts_config=args).cuda()
         # monitor = GradientAndActivationMonitor(model,track_outputs=False,verbose=True)
@@ -139,12 +210,12 @@ class Exp_Instruct(Trainer):
         concat_array = np.stack(padded_array, axis=0)
         return concat_array    
 
-    def debug_generate(self, input_ids, query_ids,ts_values, stage, attention_mask):
+    def debug_generate(self, model, input_ids, query_ids,ts_values, stage, attention_mask):
         # 生成阶段
         import time
         start_time = time.time()
         with torch.no_grad():
-            output = self.model.generate(
+            output = model.generate(
                 input_ids=input_ids,
                 query_ids=query_ids,
                 ts_values=ts_values,
@@ -185,7 +256,9 @@ class Exp_Instruct(Trainer):
 
         model = self._wrap_model(self.model, training=False)
         model.eval()
+        generation_model = self.accelerator.unwrap_model(model)
         sample_num = len(dataloader.dataset)
+        expected_indices = dataset_sample_indices(dataloader.dataset)
         # forms = []
         stages = []
         with torch.no_grad():
@@ -193,48 +266,76 @@ class Exp_Instruct(Trainer):
                 # if step==50:
                 #     break
 
+                inputs = self._prepare_inputs(inputs)
                 input_ids = inputs['input_ids']
                 ts_values = inputs['ts_values']
                 stage = inputs['stage']
                 index = inputs['index']
                 query_ids = inputs['query_ids']
                 attention_mask =inputs['attention_mask']
-                generated_ids = self.debug_generate(input_ids, 
+                generated_ids = self.debug_generate(generation_model, input_ids,
                                                     query_ids,ts_values, stage, attention_mask)
 
-                prediction = generated_ids.cpu().numpy()
+                prediction = generated_ids.detach().cpu().numpy()
                 all_predictions.extend(prediction)
-                all_labels.extend(inputs["labels"].cpu().numpy())
+                all_labels.extend(inputs["labels"].detach().cpu().numpy())
 
                 # forms.extend(inputs['form'])
-                stages.extend(inputs['stage'].tolist())
+                stages.extend(inputs['stage'].detach().cpu().tolist())
 
-                all_index.extend(inputs['index'].tolist())
+                all_index.extend(inputs['index'].detach().cpu().tolist())
 
-        filtered_preds, filtered_labels = [], []
         str_predictions = self.processor.batch_decode(all_predictions,skip_special_tokens=True)
         str_labels = self.processor.batch_decode(all_labels,skip_special_tokens=True)
         #取出assistant\n后的内容
         str_predictions = [pred.split('assistant\n')[-1] for pred in str_predictions]
+
+        local_results = [
+            {
+                "index": index,
+                "stage": stage,
+                "prediction": prediction,
+                "label": label,
+            }
+            for index, stage, prediction, label in zip(
+                all_index, stages, str_predictions, str_labels
+            )
+        ]
+        merged_results = gather_and_merge_eval_results(
+            local_results,
+            expected_num_samples=sample_num,
+            expected_indices=expected_indices,
+        )
+        output = build_eval_loop_output(merged_results, num_samples=sample_num)
+
         output_data = {
-            "predictions": str_predictions,
-            "labels": str_labels,
-            "stages": stages,
-            "index": all_index,
+            "predictions": output.predictions,
+            "labels": output.label_ids,
+            "stages": output.pred_extra["stages"],
+            "index": output.pred_extra["indices"],
             "num_samples": sample_num
         }
 
-        if accelerator.is_main_process:
-            with open('output_result_all.json', 'w', encoding='utf-8') as f:
+        if self.accelerator.is_main_process:
+            artifact_dir = getattr(self.tlmargs, "eval_output_dir", ".")
+            os.makedirs(artifact_dir, exist_ok=True)
+            output_path = os.path.join(artifact_dir, "output_result_all.json")
+            with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(output_data, f, indent=4, ensure_ascii=False)
 
-        pred_extra = {'stages': stages}
-        avg_loss = np.mean(all_losses) if all_losses else None
-        return EvalLoopOutput(predictions=str_predictions, label_ids=str_labels,
-                               metrics=avg_loss, num_samples=sample_num,pred_extra=pred_extra)
+        return output
 
 
     #写一个过滤str_predictions和str_labels的函数
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        """Keep every eval sample even though SFT training drops short batches."""
+        original_drop_last = self.args.dataloader_drop_last
+        self.args.dataloader_drop_last = False
+        try:
+            return super().get_eval_dataloader(eval_dataset)
+        finally:
+            self.args.dataloader_drop_last = original_drop_last
 
     def evaluate(
         self,
@@ -242,7 +343,7 @@ class Exp_Instruct(Trainer):
         ignore_keys=None,
         metric_key_prefix="eval",
     ):
-        eval_dataset = eval_dataset or self.eval_dataset
+        eval_dataset = self.eval_dataset if eval_dataset is None else eval_dataset
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
         output = self.generate(
             eval_dataloader, 'eval'
@@ -250,16 +351,20 @@ class Exp_Instruct(Trainer):
 
         metrics = self.custom_compute_metrics(output)
 
-        if accelerator.is_main_process:
+        if self.accelerator.is_main_process:
             # 打印到控制台
             print(metrics)
-                # 生成时间戳
+            # 生成时间戳
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'metrics_eval_{timestamp}.txt'
+            artifact_dir = getattr(self.tlmargs, "eval_output_dir", ".")
+            os.makedirs(artifact_dir, exist_ok=True)
+            filename = os.path.join(artifact_dir, f'metrics_eval_{timestamp}.json')
             # 同时写入文件
 
             with open(filename, 'w', encoding='utf-8') as f:
-                print(metrics, file=f)
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+        return metrics
 
 
     def custom_compute_metrics(self,eval_pred: EvalLoopOutput) -> Dict[str, Any]:
@@ -271,6 +376,8 @@ class Exp_Instruct(Trainer):
         Returns:
             Dict[str, Any]: BLEU 和 ROUGE 指标结果字典。
         """
+        from utils.metrics import open_question_metrics, closed_question_metrics
+
         # 解析预测和标签
         labels =  eval_pred.label_ids
         stages = eval_pred.pred_extra['stages']        
@@ -469,4 +576,3 @@ class Exp_Instruct(Trainer):
                 }
         
         return statistics
-

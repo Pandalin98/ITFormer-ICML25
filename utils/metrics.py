@@ -1,6 +1,6 @@
-from typing import List, Dict
+import re
+from typing import Dict, FrozenSet, List, Optional
 from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
-from rouge_score import rouge_scorer
 from sklearn.metrics import accuracy_score, f1_score
 from difflib import SequenceMatcher
 
@@ -32,6 +32,8 @@ def compute_rouge_from_ids(predictions, references):
     Returns:
         Dict[str, float]: Contains ROUGE-1, ROUGE-2, and ROUGE-L scores.
     """
+    from rouge_score import rouge_scorer
+
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=False)
     rouge_scores = {"rouge1": 0, "rouge2": 0, "rougeL": 0}
     count = len(predictions)
@@ -104,33 +106,127 @@ def compute_rul(predictions, references):
 
 
 
+_CLOSED_QUESTION_OPTIONS = frozenset("abcdef")
+_BARE_OPTION_SEPARATORS = re.compile(r"[,;/&+]")
+_EXPLICIT_OPTION_LIST = re.compile(
+    r"\s*[a-f]\s*[\).]"
+    r"(?:\s*(?:(?:[,;/&+]|\band\b)\s*)?[a-f]\s*[\).])*\s*",
+    re.IGNORECASE,
+)
+_LEADING_EXPLICIT_OPTION = re.compile(
+    r"\s*([a-f])\s*[\).](?:\s+(.*))?\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPLICIT_OPTION_MARKER = re.compile(
+    r"(?<![A-Za-z0-9])([a-f])\s*[\).]",
+    re.IGNORECASE,
+)
+
+
+def _parse_bare_options(text: str) -> Optional[FrozenSet[str]]:
+    """Parse an answer made only of bare A-F option labels."""
+    normalized = _BARE_OPTION_SEPARATORS.sub(" ", text)
+    tokens = normalized.split()
+    if not tokens:
+        return None
+
+    normalized_tokens = [token.lower() for token in tokens]
+    if any(
+        len(token) != 1 or token not in _CLOSED_QUESTION_OPTIONS
+        for token in normalized_tokens
+    ):
+        return None
+    return frozenset(normalized_tokens)
+
+
+def parse_closed_question_options(value) -> Optional[FrozenSet[str]]:
+    """
+    Parse strict multiple-choice output.
+
+    Accepted forms are bare option labels (for example ``a`` or ``a c``), a
+    list of explicitly punctuated labels (for example ``A), C)``), or one
+    leading explicit label followed by its answer text (for example
+    ``A) bearing failure``). Free-form text and prose containing conflicting
+    explicit labels are intentionally rejected.
+    """
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    bare_options = _parse_bare_options(text)
+    if bare_options is not None:
+        return bare_options
+
+    if _EXPLICIT_OPTION_LIST.fullmatch(text):
+        return frozenset(
+            match.group(1).lower()
+            for match in _EXPLICIT_OPTION_MARKER.finditer(text)
+        )
+
+    leading_match = _LEADING_EXPLICIT_OPTION.fullmatch(text)
+    if leading_match is None:
+        return None
+
+    leading_option = leading_match.group(1).lower()
+    explicit_options = {
+        match.group(1).lower()
+        for match in _EXPLICIT_OPTION_MARKER.finditer(text)
+    }
+    if explicit_options != {leading_option}:
+        return None
+
+    trailing_text = leading_match.group(2)
+    if trailing_text:
+        trailing_bare_options = _parse_bare_options(trailing_text)
+        if trailing_bare_options and trailing_bare_options != {leading_option}:
+            return None
+
+    return frozenset({leading_option})
+
+
 def closed_question_metrics(predictions, references, special_id=[151643]):
     """
     Compute evaluation metrics for multiple-choice questions: precision, recall, F1 score, and exact match accuracy.
 
     Args:
-        predictions (List[str]): Model predicted answers, single or multiple choices separated by spaces (e.g., 'a b e').
-        references (List[str]): Correct answers, single or multiple choices separated by spaces (e.g., 'a b').
+        predictions (List[str]): Model predicted answers in a supported strict
+            option format. Unparseable predictions are counted as invalid and
+            incorrect.
+        references (List[str]): Correct answers in a supported strict option
+            format. Empty or unparseable references raise ``ValueError``.
 
     Returns:
-        dict: Contains precision, recall, F1, and exact match accuracy.
+        dict: Contains precision, recall, F1, exact match accuracy, invalid
+            prediction count, and invalid prediction rate.
     """
+    if len(predictions) != len(references):
+        raise ValueError(
+            "predictions and references must contain the same number of items"
+        )
+    if not references:
+        raise ValueError("references must not be empty")
+
     tp, fp, fn = 0, 0, 0
     exact_match_count = 0
+    invalid_count = 0
 
-    for pred, ref in zip(predictions, references):
-        # Convert strings to sets
-        pred_set = set(pred.split())
-        ref_set = set(ref.split())
+    for index, (pred, ref) in enumerate(zip(predictions, references)):
+        ref_set = parse_closed_question_options(ref)
+        if ref_set is None:
+            raise ValueError(
+                f"reference at index {index} is empty or cannot be parsed "
+                "as an A-F option answer"
+            )
 
-        # Convert characters in pred_set to lowercase
-        pred_set = {token.lower() for token in pred_set}
-        # Remove non-option characters from pred_set (only keep a-z)
-        pred_set = {token for token in pred_set if token in [
-            'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
-            'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q',
-            'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'
-        ]}
+        parsed_prediction = parse_closed_question_options(pred)
+        if parsed_prediction is None:
+            invalid_count += 1
+            pred_set = frozenset()
+        else:
+            pred_set = parsed_prediction
 
         # Compute True Positives, False Positives, False Negatives
         tp += len(pred_set & ref_set)  # Correctly predicted options
@@ -146,12 +242,15 @@ def closed_question_metrics(predictions, references, special_id=[151643]):
     recall = tp / (tp + fn) if tp + fn > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
     exact_match_accuracy = exact_match_count / len(references) if len(references) > 0 else 0.0
+    invalid_rate = invalid_count / len(references)
 
     return {
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "exact_match_accuracy": exact_match_accuracy,
+        "invalid_count": invalid_count,
+        "invalid_rate": invalid_rate,
     }
 
 # # Example data
@@ -161,4 +260,3 @@ def closed_question_metrics(predictions, references, special_id=[151643]):
 # # Call function
 # metrics = closed_question_metrics(predictions, references)
 # print(metrics)
-

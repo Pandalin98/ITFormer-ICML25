@@ -58,6 +58,29 @@ The inference script will:
 - Distribute data across all available GPUs.
 - Aggregate and save results to `inference_results/` and `output_result_all.json`.
 
+### Evaluation correctness
+
+Each EngineMT-QA JSONL record contains multiple QA pairs.  Evaluation uses a
+flattened QA index as the unique sample ID; the JSONL line number is retained
+only as `source_line`.  This is important for distributed inference because
+deduplicating by JSONL line drops most QA pairs and can remove Stage 4 entirely.
+
+The standalone inference path and the SFT built-in evaluation now use the same
+distributed merge rule.  You can audit the released test split with:
+
+```bash
+python scripts/audit_enginemt_qa.py \
+  --qa dataset/datasets/test_qa.jsonl \
+  --h5 dataset/datasets/time_series_data.h5
+```
+
+For the currently released files, the test split contains 42,477 flattened QA
+pairs (Stage 1: 17,240; Stage 2: 15,085; Stage 3: 6,768; Stage 4: 3,384).
+The released `seq_data` tensor has shape `(118921, 600, 33)`.  The HDF5 file
+does not contain channel-name metadata, so downstream code should not assume
+that the last dimension is 32 or assign semantic labels without an authoritative
+mapping from the dataset authors.
+
 ---
 
 ## Training

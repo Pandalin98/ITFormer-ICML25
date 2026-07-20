@@ -66,7 +66,18 @@ def find_assistant_tokens(tokenizer, target):
 class TsQaDataset(Dataset):
     """Time Series Question Answering Dataset with token ID range validation."""
     
-    def __init__(self, ts_path, data_path, tokenizer, processor, config, pretrain=False, sft=False, shuffle=False):
+    def __init__(
+        self,
+        ts_path,
+        data_path,
+        tokenizer,
+        processor,
+        config,
+        pretrain=False,
+        sft=False,
+        shuffle=False,
+        strict_preprocessing=False,
+    ):
         """Initialize the dataset.
         
         Args:
@@ -88,6 +99,7 @@ class TsQaDataset(Dataset):
         self.pretrain = pretrain
         self.sft = sft
         self.shuffle = shuffle
+        self.strict_preprocessing = strict_preprocessing
         self.h5_file = None
         
         # Key fix: Ensure vocab_size is correct
@@ -162,7 +174,12 @@ class TsQaDataset(Dataset):
                             'form': item['conversations'][i]['attribute'],
                             'question': item['conversations'][i]['value'],
                             'answer': item['conversations'][i + 1]['value'],
-                            'line_num': line_num
+                            'qa_offset': i // 2,
+                            # A JSONL line contains multiple QA pairs.  Keep a
+                            # globally unique flattened index for distributed
+                            # evaluation and retain the source line separately.
+                            'sample_index': len(self.datas),
+                            'source_line': line_num,
                         })
         
         if self.shuffle:
@@ -238,8 +255,10 @@ class TsQaDataset(Dataset):
             return [self.tokenizer.eos_token_id]
 
     def __getitem__(self, idx):
+        # Let invalid dataset indices follow the normal Dataset contract instead
+        # of turning them into an unrelated fallback QA.
+        sample = self.datas[idx]
         try:
-            sample = self.datas[idx]
             # sample = self.add_adaptive_prompt(sample)
 
             # Load time series data
@@ -292,7 +311,8 @@ class TsQaDataset(Dataset):
                     'input_ids': final_input_ids,
                     'labels': final_labels,
                     'ts_values': torch.tensor(ts, dtype=torch.float),
-                    'index': sample['line_num']
+                    'index': sample['sample_index'],
+                    'source_line': sample['source_line'],
                 }
 
             # =========================== Mode 3: Inference/Evaluation ===========================
@@ -322,24 +342,73 @@ class TsQaDataset(Dataset):
                     'input_ids': q_input_ids,
                     'labels': a_input_ids,
                     'ts_values': torch.tensor(ts, dtype=torch.float),
-                    'index': sample['line_num']
+                    'index': sample['sample_index'],
+                    'source_line': sample['source_line'],
+                    'qa_offset': sample['qa_offset'],
+                    'reference': sample['answer'],
                 }
                 
         except Exception as e:
             adaptive_print(f"❌ Error processing sample {idx}: {e}")
-            # Return a safe default sample
-            return self._get_safe_default_sample()
+            if getattr(self, 'strict_preprocessing', False):
+                raise RuntimeError(
+                    f"Failed to preprocess QA sample {idx} "
+                    f"(flattened index {sample.get('sample_index', idx)}): {e}"
+                ) from e
+            # Preserve the QA identity even when preprocessing falls back.  A
+            # shared sentinel index would make unrelated failures look like
+            # distributed-sampler duplicates during result aggregation.
+            return self._get_safe_default_sample(
+                sample_index=sample.get('sample_index', idx),
+                source_line=sample.get('source_line', -1),
+                stage=sample.get('stage', 1),
+                form=sample.get('form', 'default'),
+                qa_offset=sample.get('qa_offset', -1),
+                reference=sample.get('answer', ''),
+            )
 
-    def _get_safe_default_sample(self):
-        """Return a safe default sample."""
+    def _get_safe_ts_shape(self):
+        """Return a collator-compatible time-series shape for fallback samples."""
+        try:
+            h5f = self._get_h5_file()
+            if h5f is not None and 'seq_data' in h5f:
+                shape = tuple(int(size) for size in h5f['seq_data'].shape[1:])
+                if shape:
+                    return shape
+        except Exception:
+            pass
+
+        input_len = int(getattr(self.config, 'input_len', 600))
+        channel_num = int(
+            getattr(
+                self.config,
+                'channel_num',
+                getattr(self.config, 'enc_in', 33),
+            )
+        )
+        return (input_len, channel_num)
+
+    def _get_safe_default_sample(
+        self,
+        sample_index=-1,
+        source_line=-1,
+        stage=1,
+        form='default',
+        qa_offset=-1,
+        reference="",
+    ):
+        """Return a safe default sample that can be stacked with real samples."""
         return {
-            'form': 'default',
-            'stage': 1,
+            'form': form,
+            'stage': stage,
             'query_ids': [self.tokenizer.eos_token_id],  # Simple default query
             'input_ids': [self.tokenizer.eos_token_id],
             'labels': [self.tokenizer.eos_token_id],
-            'ts_values': torch.zeros(100, dtype=torch.float),
-            'index': 0
+            'ts_values': torch.zeros(self._get_safe_ts_shape(), dtype=torch.float),
+            'index': sample_index,
+            'source_line': source_line,
+            'qa_offset': qa_offset,
+            'reference': reference,
         }
 
     def __del__(self):
@@ -378,6 +447,9 @@ class DataCollator:
         ts_values = []
         stages = []
         index = []
+        source_line = []
+        qa_offset = []
+        references = []
         query_ids = []
         for feature in features:
             input_len = len(feature['input_ids'])
@@ -401,6 +473,9 @@ class DataCollator:
             ts_values.append(feature['ts_values'])
             stages.append(feature['stage'])
             index.append(feature['index'])
+            source_line.append(feature.get('source_line', -1))
+            qa_offset.append(feature.get('qa_offset', -1))
+            references.append(feature.get('reference', ''))
 
 
         return {
@@ -410,7 +485,8 @@ class DataCollator:
             'ts_values': torch.stack(ts_values, dim=0),
             'stage': torch.tensor(stages, dtype=torch.int8),
             'index': torch.tensor(index, dtype=torch.int32),
+            'source_line': torch.tensor(source_line, dtype=torch.int32),
+            'qa_offset': torch.tensor(qa_offset, dtype=torch.int16),
+            'reference': references,
             'query_ids': torch.tensor(query_ids, dtype=torch.long)
         }
-
-

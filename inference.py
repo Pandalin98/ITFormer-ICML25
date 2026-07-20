@@ -24,6 +24,11 @@ from torch.utils.data import DataLoader
 from utils.metrics import open_question_metrics, closed_question_metrics
 from typing import List, Dict, Any
 from accelerate import Accelerator  
+from utils.result_utils import (
+    dataset_sample_indices,
+    merge_unique_results,
+    rank_strided_positions,
+)
 
 def set_seed(seed=42):
     """Set random seed for reproducibility."""
@@ -141,15 +146,14 @@ def main_inference(args):
     if accelerator.is_main_process:
         print(f"✅ Model loaded successfully!")
         print("\n📊 Preparing test dataset...")
-    # Load tokenizer
-    if os.path.exists(os.path.join(args.model_checkpoint, "tokenizer.json")):
-        if accelerator.is_main_process:
-            print("Loading tokenizer from checkpoint")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_checkpoint)
-    else:
-        if accelerator.is_main_process:
-            print("Loading tokenizer from original model")
-        tokenizer = model.tokenizer
+    # The TLM implementation reconstructs its LLM from ``llm_model_path`` and
+    # intentionally ignores checkpoint LLM weights.  Use that model's tokenizer
+    # as well so standalone inference obeys the same tokenization contract as
+    # SFT evaluation.  Loading a separately serialized checkpoint tokenizer can
+    # otherwise introduce version-dependent differences.
+    tokenizer = accelerator.unwrap_model(model).tokenizer
+    if accelerator.is_main_process:
+        print("Loading tokenizer from the reconstructed LLM model")
     # Add special token if not present
     if '<|image_pad|>' not in tokenizer.get_vocab():
         if accelerator.is_main_process:
@@ -168,20 +172,41 @@ def main_inference(args):
         args.qa_path_test,
         tokenizer,
         tokenizer,  # Use tokenizer as processor
-        tlmconfig
+        tlmconfig,
+        strict_preprocessing=True,
     )
+    if args.max_samples is not None:
+        from torch.utils.data import Subset
+        test_dataset = Subset(
+            test_dataset,
+            range(min(args.max_samples, len(test_dataset))),
+        )
+    expected_indices = sorted(dataset_sample_indices(test_dataset))
+    from torch.utils.data import Subset
+
+    local_positions = rank_strided_positions(
+        len(test_dataset),
+        process_index=accelerator.process_index,
+        num_processes=accelerator.num_processes,
+    )
+    local_test_dataset = Subset(test_dataset, local_positions)
     data_collator = DataCollator(tokenizer=tokenizer)
     test_loader = DataLoader(
-        test_dataset,
+        local_test_dataset,
         batch_size=args.batch_size,
         collate_fn=data_collator,
         num_workers=args.num_workers
     )
-    # Prepare dataloader with accelerator
-    test_loader = accelerator.prepare(test_loader)
     if accelerator.is_main_process:
         print(f"📁 Test set size: {len(test_dataset)} samples")
-        print(f"🔢 Batch size: {args.batch_size}, Total batches: {len(test_loader)}")
+        print(
+            f"🔢 Batch size: {args.batch_size}, "
+            f"rank-0 batches: {len(test_loader)}"
+        )
+        print(
+            "🧩 Distributed inference uses an explicit padding-free strided "
+            "dataset partition."
+        )
         print("\n🔍 Starting test set inference...")
     results = []
     with torch.no_grad():
@@ -191,9 +216,12 @@ def main_inference(args):
         else:
             batch_iterator = test_loader
         for batch_idx, batch in enumerate(batch_iterator):
-            # if batch_idx ==16:
-            #     break
-            # Data is already on the correct device thanks to accelerator
+            batch = {
+                key: value.to(accelerator.device)
+                if torch.is_tensor(value)
+                else value
+                for key, value in batch.items()
+            }
             
             # 使用 unwrap_model 来调用原始模型的 generate 方法
             unwrapped_model = accelerator.unwrap_model(model)
@@ -233,33 +261,62 @@ def main_inference(args):
                 prediction = batch_predictions[i].split('assistant\n')[-1]
                 results.append({
                     "index": batch['index'][i].item(),
+                    "source_line": batch['source_line'][i].item(),
+                    "qa_offset": batch['qa_offset'][i].item(),
                     "stage": batch['stage'][i].item(),
                     "input": tokenizer.decode(batch['input_ids'][i], skip_special_tokens=True),
                     "prediction": prediction,
-                    "label": batch_labels[i],
-                    "is_correct": prediction.strip() == batch_labels[i].strip()
+                    # Preserve the source JSON reference verbatim. Tokenizer
+                    # round-trips are useful diagnostics but are not the
+                    # benchmark ground truth contract.
+                    "label": batch['reference'][i],
+                    "decoded_label": batch_labels[i],
+                    "is_correct": (
+                        prediction.strip() == batch['reference'][i].strip()
+                    )
                 })
     if accelerator.is_main_process:
         print("\n📊 Calculating evaluation metrics...")
+
+    # Persist every rank before the collective merge. If a later metric or
+    # validation step fails, completed generation remains recoverable.
+    rank_shard_dir = os.path.join(args.output_dir, "rank_shards")
+    os.makedirs(rank_shard_dir, exist_ok=True)
+    rank_shard_path = os.path.join(
+        rank_shard_dir,
+        f"rank_{accelerator.process_index:05d}.json",
+    )
+    with open(rank_shard_path, "w", encoding="utf-8") as handle:
+        json.dump(results, handle, ensure_ascii=False)
+    accelerator.wait_for_everyone()
     
     # 汇总所有进程的结果
-    all_results = [None] * accelerator.num_processes
-    # 使用 gather_object 汇总 list
+    result_groups = [results]
+    # 使用 gather_object 汇总每个 rank 的 list
     import torch.distributed as dist
     if dist.is_initialized():
-        dist.all_gather_object(all_results, results)
-        # 将嵌套列表打平
-        results = [item for sublist in all_results for item in sublist]
+        result_groups = [None] * accelerator.num_processes
+        dist.all_gather_object(result_groups, results)
     
     if accelerator.is_main_process:
-        # 去重（防止分布式采样导致的重复数据）
-        seen_indices = set()
-        unique_results = []
-        for r in results:
-            if r['index'] not in seen_indices:
-                unique_results.append(r)
-                seen_indices.add(r['index'])
-        results = sorted(unique_results, key=lambda x: x['index'])
+        # ``index`` is the flattened QA index.  This removes only distributed
+        # sampler padding and never collapses QA pairs from the same JSONL line.
+        results = merge_unique_results(result_groups)
+        actual_indices = [item["index"] for item in results]
+        if actual_indices != expected_indices:
+            missing = sorted(set(expected_indices) - set(actual_indices))
+            unexpected = sorted(set(actual_indices) - set(expected_indices))
+            raise RuntimeError(
+                "Distributed inference returned the wrong QA index set. "
+                f"Missing indices: {missing[:10]}; unexpected indices: "
+                f"{unexpected[:10]}."
+            )
+        if len(results) != len(test_dataset):
+            raise RuntimeError(
+                "Distributed inference produced "
+                f"{len(results)} unique QA results, expected {len(test_dataset)}. "
+                "Check rank gathering, sampler padding, and flattened QA indices."
+            )
 
         metrics = compute_metrics_from_results(results, args)
         print_metrics(metrics)
@@ -339,5 +396,6 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers')
     parser.add_argument('--max_new_tokens', type=int, default=128, help='Maximum new tokens to generate')
+    parser.add_argument('--max_samples', type=int, default=None, help='Optional leading subset size for smoke evaluation')
     args = parser.parse_args()
     main_inference(args)

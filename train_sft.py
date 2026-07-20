@@ -1,41 +1,24 @@
-from transformers import PreTrainedModel, PretrainedConfig, AutoTokenizer, AutoModelForCausalLM
-from transformers import AutoProcessor, AutoModel
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning, message=".*TRANSFORMERS_CACHE.*")
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import Trainer, TrainingArguments, DataCollatorWithPadding
-from dataset.dataset import TsQaDataset,DataCollator
+"""SFT training and checkpoint evaluation entry point."""
+
+from __future__ import annotations
+
 import argparse
-from models.TimeLanguageModel import TLMConfig, TLM
-import os
-import swanlab as wandb
-from EXP.exp_instruct import Exp_Instruct
-from accelerate import Accelerator
-accelerator = Accelerator(device_placement=True)# # 限制只使用 GPU 0,debug模式
 import os
 import random
-import numpy as np
-import sys
-import logging
-from transformers.utils import logging as transformers_logging
+import warnings
+from collections.abc import Sequence
 
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, message=".*TRANSFORMERS_CACHE.*"
+)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["WANDB_MODE"] = "offline"
 
-# 设置日志级别，主进程显示进度，从进程静默
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    transformers_logging.set_verbosity_info()
-else:
-    transformers_logging.set_verbosity_error()
-    logging.disable(logging.CRITICAL)
+def _is_main_process_from_env() -> bool:
+    return os.environ.get("LOCAL_RANK", "0") in {"", "-1", "0"}
 
-# # 启用异常检测
 
-if __name__ == '__main__':
-    #读取args
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Mutimodal SFT')
     parser.add_argument('--fix_seed', type=int, default=None, help='seed')
 
@@ -79,13 +62,15 @@ if __name__ == '__main__':
     parser.add_argument('--freeze_ts_model',type=bool,default=True,help='wheter freeze ts encoder')
     #Efficiency settings
     parser.add_argument('--fp16', type=bool, default=True, help='whether to use 16-bit (mixed) precision')
+    parser.add_argument('--bf16', action='store_true',
+                        help='use bfloat16 mixed precision instead of fp16')
     parser.add_argument('--dataloader_pin_memory', type=bool, default=True, help='pin memory in data loader')
     parser.add_argument('--dataloader_num_workers', type=int, default=4, help='number of subprocesses to use for data loading')
 
     #logging settings
     parser.add_argument('--output_dir', type=str, default='save/sft_qwen2.5_0.5B_infra', help='output directory')
     parser.add_argument('--save_steps', type=int, default=1000, help='save checkpoint every X updates steps')
-    
+
     parser.add_argument('--save_total_limit', type=int, default=10, help='limit the total amount of checkpoints')
     parser.add_argument('--logging_steps', type=int, default=50, help='log every X updates steps')
     parser.add_argument('--eval_steps', type=int, default=300000000000000000, help='eval every X updates steps')
@@ -94,9 +79,49 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, default='train', help='inference or train')
     parser.add_argument('--eval_stragy',type=str,default="no",help='The evaluation strategy to adopt during training')
     parser.add_argument('--shuffle', type=bool, default=True, help='whether to shuffle the dataset')
+    parser.add_argument('--skip_eval', action='store_true',
+                        help='skip the built-in distributed evaluation; use inference.py separately')
+    parser.add_argument('--eval_only', action='store_true',
+                        help='load an existing SFT checkpoint and run built-in evaluation only')
+    parser.add_argument('--model_checkpoint', type=str, default=None,
+                        help='SFT checkpoint used by --eval_only')
+    parser.add_argument('--eval_output_dir', type=str, default='eval_results',
+                        help='directory for built-in evaluation artifacts')
+    parser.add_argument('--eval_max_samples', type=int, default=None,
+                        help='optional leading subset size for eval smoke tests')
+    parser.add_argument('--ts_data_path', type=str,
+                        default='dataset/datasets/time_series_data.h5',
+                        help='HDF5 time-series data used by SFT and evaluation')
+    parser.add_argument('--train_qa_path', type=str,
+                        default='dataset/datasets/train_qa.jsonl',
+                        help='training QA JSONL path')
+    parser.add_argument('--test_qa_path', type=str,
+                        default='dataset/datasets/test_qa.jsonl',
+                        help='evaluation QA JSONL path')
+    return parser
 
 
-    args = parser.parse_args()
+def _run_sft(args: argparse.Namespace) -> None:
+    # Keep heavy ML imports lazy so parser and unit tests stay lightweight.
+    import logging
+
+    import numpy as np
+    import torch
+    from accelerate import Accelerator
+    from dataset.dataset import TsQaDataset
+    from EXP.exp_instruct import Exp_Instruct
+    from models.TimeLanguageModel import TLMConfig
+    from transformers import AutoProcessor, AutoTokenizer
+    from transformers.utils import logging as transformers_logging
+
+    accelerator = Accelerator(device_placement=True)
+
+    # 设置日志级别，主进程显示进度，从进程静默
+    if _is_main_process_from_env():
+        transformers_logging.set_verbosity_info()
+    else:
+        transformers_logging.set_verbosity_error()
+        logging.disable(logging.CRITICAL)
 
     # 设置固定的随机种子
     seed = 42
@@ -115,31 +140,66 @@ if __name__ == '__main__':
     tlmconfig = TLMConfig(llm_model_path = args.llm_model_path,freeze_ts_model=args.freeze_ts_model,
                           ts_pad_num=args.prefix_num)
     
-    ts_past_train = 'dataset/datasets/time_series_data.h5'
-    qa_past_train = 'dataset/datasets/train_qa.jsonl'
+    ts_past_train = args.ts_data_path
+    qa_past_train = args.train_qa_path
     
-    ts_path_test = 'dataset/datasets/time_series_data.h5'
-    qa_path_test = 'dataset/datasets/test_qa.jsonl'
+    ts_path_test = args.ts_data_path
+    qa_path_test = args.test_qa_path
 
     tokenizer = AutoTokenizer.from_pretrained(tlmconfig.llm_model_path)
     tokenizer.padding_side = 'left'
     processor = AutoProcessor.from_pretrained(tlmconfig.llm_model_path)
     train_dataset = TsQaDataset(ts_past_train, qa_past_train, 
-                          tokenizer, processor, tlmconfig,sft=True, shuffle=args.shuffle)
+                          tokenizer, processor, tlmconfig, sft=True,
+                          shuffle=args.shuffle, strict_preprocessing=True)
     test_dataset = TsQaDataset(ts_path_test, qa_path_test,
-                            tokenizer, processor, tlmconfig)
+                            tokenizer, processor, tlmconfig,
+                            strict_preprocessing=True)
+    eval_dataset = test_dataset
+    if args.eval_max_samples is not None:
+        from torch.utils.data import Subset
+        eval_dataset = Subset(
+            test_dataset,
+            range(min(args.eval_max_samples, len(test_dataset))),
+        )
 
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and not args.eval_only:
         import swanlab as wandb
         # wandb.init(project="TSLLM", name="pandalin")
         #设置offline
         wandb.init(mode="offline", project="XXX", name="XXX")
-    Trainer = Exp_Instruct(args, train_dataset=train_dataset, eval_dataset=test_dataset,tlm_config=tlmconfig)       # Trainer.train(resume_from_checkpoint=False)
+    trainer_dataset = test_dataset if args.eval_only else train_dataset
+    Trainer = Exp_Instruct(
+        args,
+        train_dataset=trainer_dataset,
+        eval_dataset=eval_dataset,
+        tlm_config=tlmconfig,
+    )
+    if args.eval_only:
+        Trainer.load_model(args.model_checkpoint)
+        Trainer.evaluate()
+        return
+
     Trainer.train(resume_from_checkpoint=False)
-    Trainer.evaluate()
+    final_dir = os.path.join(args.output_dir, "final")
+    Trainer.save_model(final_dir)
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(final_dir)
+    accelerator.wait_for_everyone()
+    if not args.skip_eval:
+        Trainer.evaluate()
 
-    
-    
 
-    
-    
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.eval_only and not args.model_checkpoint:
+        parser.error("--eval_only requires --model_checkpoint")
+
+    _run_sft(args)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
